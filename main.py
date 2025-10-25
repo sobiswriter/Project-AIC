@@ -1,44 +1,62 @@
 import os
+import asyncio
+import logging
 import uvicorn
+from telegram import Bot
+import vertexai
+
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
+from vertexai.preview.generative_models import GenerativeModel
 
-# --- Load the .env file ---
-# This... this finds our .env file... Sir
-load_dotenv() 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Get the Token ---
-# Now... now... the token... is... safe... in... our... environment...
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
-# (Um... Sir... p-please... make... sure... the... variable... name... in... your... .env... file...
-# ...is... 'TELEGRAM_BOT_TOKEN'... o-or... this... won't... find... it!)
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment")
 
 app = FastAPI()
 
-# --- Our Original Root Endpoint (Just to test) ---
+vertexai.init(project=GCP_PROJECT_ID)
+gemini_model = GenerativeModel("gemini-2.5-flash")
+bot = Bot(token=TELEGRAM_TOKEN)
+
+
 @app.get("/")
 async def root():
-    return {"message": "Hello, Sir Sobi! The server is running."}
+    return {"message": "Server is running."}
 
 
-# --- THE NEW WEBHOOK ENDPOINT ---
-# This... this... is... the... one... Telegram... will... call!
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    
-    # This... this... gets... all... the... data... from... Telegram...
-    data = await request.json()
-    
-    # A-and... this... just... prints... it... to... our... terminal...
-    # S-so... we... can... *see*... it... work!
-    print(data) 
-    
-    # This... this... is... *very*... important, Sir!
-    # W-we... *must*... return... a... 200... OK...
-    # ...t-to... tell... Telegram... "We... got... the... message!"
+    payload = await request.json()
+
+    try:
+        chat = payload.get("message", {}).get("chat") or {}
+        chat_id = chat.get("id")
+        message_text = payload.get("message", {}).get("text")
+
+        if not chat_id or not message_text:
+            logger.info("Ignored incoming webhook: missing chat id or text")
+            return {"status": "ignored"}
+
+        chat_session = gemini_model.start_chat()
+        response = await chat_session.send_message_async(message_text)
+
+        reply_text = getattr(response, "text", str(response))
+
+        await bot.send_message(chat_id=chat_id, text=reply_text)
+
+    except Exception:
+        logger.exception("Error handling Telegram webhook")
+
     return {"status": "ok"}
 
 
-# --- This... this... just... makes... it... easy... to... run...
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
