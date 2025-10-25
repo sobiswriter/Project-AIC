@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+google-cloud-aiplatform
+python-telegram-bot==13.15
