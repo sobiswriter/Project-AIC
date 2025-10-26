@@ -4,3 +4,4 @@ google-cloud-aiplatform
 python-telegram-bot>=20.0
 ngrok
 python-dotenv
+google-cloud-firestore
