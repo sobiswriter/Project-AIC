@@ -5,7 +5,7 @@ import uvicorn
 import datetime
 from telegram import Bot
 import vertexai
-import pytz # <-- W-we... need... this... for... timezones, Sir!
+import pytz
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -44,7 +44,10 @@ async def save_memory(user_id: int, user_text: str, bot_text: str):
         summary_text = summary_response.text.strip()
         memory_collection_ref = db.collection(f"users/{user_id}/user_memories")
         memory_data = {"text": summary_text, "created_at": firestore.SERVER_TIMESTAMP}
-        await memory_collection_ref.add(memory_data)
+        
+        # --- FIXED: Removed 'await' from this line ---
+        memory_collection_ref.add(memory_data) 
+        
         logger.info(f"Successfully saved memory for user {user_id}: {summary_text}")
     except Exception:
         logger.exception(f"Could not save memory for user {user_id}")
@@ -72,11 +75,10 @@ async def telegram_webhook(request: Request):
             logger.info("Ignored incoming webhook: missing data")
             return {"status": "ignored"}
         
-        # --- NEW: Set waiting_for_reply to FALSE when user messages ---
-        # Th-this... is... the... "Quiet Down" Rule[cite: 80], Sir!
-        # W-when... the... user... messages... us... we... *know*... they... replied!
         user_ref = db.collection("users").document(str(user_id))
-        await user_ref.set({"waiting_for_reply": False}, merge=True)
+        
+        # --- FIXED: Removed 'await' from this line ---
+        user_ref.set({"waiting_for_reply": False}, merge=True)
 
         chat_session = gemini_model.start_chat()
         response = await chat_session.send_message_async(message_text)
@@ -88,13 +90,12 @@ async def telegram_webhook(request: Request):
     return {"status": "ok"}
 
 
-# --- THIS... IS... THE... *NEW*... HEARTBEAT, SIR! ---
+# --- Heartbeat Endpoint ---
 @app.post("/run-will-triggers")
 async def run_will_triggers():
     logger.info("The 'Will' has fired! Checking proactive triggers...")
     
     try:
-        # Get all users from Firestore
         users_stream = db.collection("users").stream()
 
         for user_doc in users_stream:
@@ -102,33 +103,22 @@ async def run_will_triggers():
             user_data = user_doc.to_dict()
             logger.info(f"Checking triggers for user {user_id}...")
 
-            # --- ANTI-ANNOYANCE RULE 1: The "Quiet Down" Rule  ---
             if user_data.get("waiting_for_reply", False):
-                logger.info(f"Skipping user {user_id}: waiting_for_reply is true[cite: 79].")
-                continue # S-Sir... this... skips... to... the... next... user!
+                logger.info(f"Skipping user {user_id}: waiting_for_reply is true.")
+                continue 
 
-            # --- ANTI-ANNOYANCE RULE 2: The "Active Hours" Rule  ---
             user_tz = pytz.timezone(user_data.get("timezone", "UTC"))
             now_local = datetime.datetime.now(user_tz)
-            
-            # W-we... get... the... hours... from... Firestore, Sir...
-            start_hour = int(user_data.get("active_hours_start", 9)) # Default 9 AM
-            end_hour = int(user_data.get("active_hours_end", 23)) # Default 11 PM
+            start_hour = int(user_data.get("active_hours_start", 9))
+            end_hour = int(user_data.get("active_hours_end", 23))
 
             if not (start_hour <= now_local.hour < end_hour):
-                logger.info(f"Skipping user {user_id}: Outside active hours[cite: 84].")
-                continue # Skips... to... the... next... user!
+                logger.info(f"Skipping user {user_id}: Outside active hours.")
+                continue
 
-            # --- IF... WE... GET... *HERE*... IT... MEANS... IT'S... SAFE... TO... PROCEED! ---
             logger.info(f"User {user_id} passed all anti-annoyance checks!")
-
-            # ...
-            # ... S-Sir... *THIS*... is... where... we... will... build...
-            # ... the... *real*... Priority Queue... (P1, P2, P3, P4)
-            # ...
             
-            # For... now... let's... just... break... s-so... we... only... run... one... user...
-            break # S-Sir... this... stops... the... loop... for... testing...
+            break
 
     except Exception:
         logger.exception("Error during /run-will-triggers")
