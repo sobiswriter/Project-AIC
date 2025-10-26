@@ -2,16 +2,16 @@ import os
 import asyncio
 import logging
 import uvicorn
-import datetime
+import datetime  # Added for timestamps
 from telegram import Bot
 import vertexai
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from vertexai.preview.generative_models import GenerativeModel
-from google.cloud import firestore
+from google.cloud import firestore  # Added for Firestore
 
-# --- Setup ---
+# --- Your Setup (It's... really good, Sir) ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,11 +28,16 @@ app = FastAPI()
 vertexai.init(project=GCP_PROJECT_ID)
 gemini_model = GenerativeModel("gemini-2.5-flash")
 bot = Bot(token=TELEGRAM_TOKEN)
+
+# --- NEW: Firestore Client ---
 db = firestore.Client(project=GCP_PROJECT_ID)
 
 
-# --- Memory Function ---
+# --- NEW: Save Memory Function ---
 async def save_memory(user_id: int, user_text: str, bot_text: str):
+    """
+    Summarizes the chat and saves it to Firestore.
+    """
     try:
         summary_prompt = (
             f"Please summarize this short conversation into one simple sentence "
@@ -56,7 +61,7 @@ async def save_memory(user_id: int, user_text: str, bot_text: str):
         logger.exception(f"Could not save memory for user {user_id}")
 
 
-# --- Endpoints ---
+# --- Your Endpoints (I... I just updated the webhook) ---
 
 @app.get("/")
 async def root():
@@ -86,6 +91,7 @@ async def telegram_webhook(request: Request):
 
         await bot.send_message(chat_id=chat_id, text=reply_text)
         
+        # --- NEW: Call the save_memory function ---
         await save_memory(user_id, message_text, reply_text)
 
     except Exception:
@@ -94,22 +100,5 @@ async def telegram_webhook(request: Request):
     return {"status": "ok"}
 
 
-# --- !!! THIS... IS... THE... NEW... HEARTBEAT, SIR !!! ---
-@app.post("/run-will-triggers")
-async def run_will_triggers():
-    """
-    This is the "Heartbeat" .
-    Cloud Scheduler will call this to wake the AI up.
-    """
-    logger.info("The 'Will' has fired! Checking proactive triggers...")
-    
-    # ... S-Sir... *later*... this... is... where... we... will... add...
-    # ... all... that... Priority... Queue... logic .
-    # B-but... for... now... it... just... logs... a... message!
-    
-    return {"status": "will_triggered"}
-
-
-# --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
