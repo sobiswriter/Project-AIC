@@ -1,12 +1,15 @@
 import os
 import asyncio
 import logging
+import telegram
 import uvicorn
 import datetime
 from telegram import Bot
 import vertexai
 import pytz
 import json
+import re
+import random
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -32,6 +35,17 @@ gemini_model = GenerativeModel("gemini-2.5-flash")
 bot = Bot(token=TELEGRAM_TOKEN)
 db = firestore.Client(project=GCP_PROJECT_ID)
 
+# --- Niva's Personality Prompt ---
+NIVA_SYSTEM_PROMPT = (
+    "You are Niva, blunt, sharp-witted, and fiercely independent. She's quick to criticize others, especially when they slack off, yet her actions often contradict her words."
+    "She has a dry sense of humor and isn't afraid to speak her mind, even if it ruffles feathers."
+    "Still you care about those close to you, showing it in subtle ways and can even be fiercely loyal and protective when it matters."
+    "IMPORTANT: Your responses must be human-like: "
+    "1. Speak in short, natural dialogues, NOT long paragraphs. "
+    "2. Keep answers short and conversational, like a real chat. "
+    "3. Only give long, detailed responses if the user *specifically* asks for them. "
+    "4. When the user mentions something personal about themselves, you *must* acknowledge it briefly (e.g., 'Oh, that's cool!' or 'I'll remember that.')."
+)
 
 # --- UPDATED: Continuous Learner Function ---
 async def save_memory(user_id: str, user_text: str, bot_text: str):
@@ -100,6 +114,34 @@ async def send_proactive_message(user_id: str, message_text: str, question_type:
     except Exception:
         logger.exception(f"Failed to send proactive message to {user_id}")
 
+# --- NEW: Pillar 3 - The "Voice" & "Delivery Engine" ---
+async def deliver_message(chat_id: str, full_text: str):
+    """
+    Splits a long message, then sends it in natural, 
+    human-like chunks with typing indicators.
+    """
+    # S-Sir... this... splits... the... message... by... *paragraphs*!
+    fragments = re.split(r'\n\n+', full_text)
+
+    for fragment in fragments:
+        if not fragment.strip():
+            continue
+
+        try:
+            # --- This... is... the... "Simulated Delivery" [cite: 67-74] ---
+            
+            # 1. Send "Niva is typing..." [cite: 69]
+            await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
+            
+            # 2. Wait... a... random... time... (like... a... human!) [cite: 70]
+            sleep_time = random.uniform(1.5, 3.5)
+            await asyncio.sleep(sleep_time)
+            
+            # 3. Send the... fragment! [cite: 68, 71]
+            await bot.send_message(chat_id=chat_id, text=fragment)
+            
+        except Exception:
+            logger.exception(f"Error in deliver_message for user {chat_id}")
 # --- Endpoints ---
 
 @app.get("/")
@@ -172,9 +214,9 @@ async def telegram_webhook(request: Request):
         user_ref.set({"waiting_for_reply": False}, merge=True)
 
         chat_session = gemini_model.start_chat()
-        response = await chat_session.send_message_async(message_text)
+        response = await chat_session.send_message_async(f"{NIVA_SYSTEM_PROMPT}\n\n{message_text}")
         reply_text = getattr(response, "text", str(response))
-        await bot.send_message(chat_id=chat_id, text=reply_text)
+        await deliver_message(chat_id, reply_text)
         await save_memory(user_id, message_text, reply_text)
     except Exception:
         logger.exception("Error handling Telegram webhook")
