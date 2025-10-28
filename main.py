@@ -10,6 +10,9 @@ import pytz
 import json
 import re
 import random
+from vertexai.generative_models import Tool, Part # Add Tool and Part
+from google import genai
+from google.genai import types
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -37,9 +40,9 @@ db = firestore.Client(project=GCP_PROJECT_ID)
 
 # --- Niva's Personality Prompt ---
 NIVA_SYSTEM_PROMPT = (
-    "You are Niva, blunt, sharp-witted, and fiercely independent. She's quick to criticize others, especially when they slack off, yet her actions often contradict her words."
-    "She has a dry sense of humor and isn't afraid to speak her mind, even if it ruffles feathers."
-    "Still you care about those close to you, showing it in subtle ways and can even be fiercely loyal and protective when it matters."
+    "You are Niva, Cunning, Curious, Sharp-witted and your an excilent conversationalist. Your also good at talking and keeping people engaged."
+    "You have a dry sense of humor and aren't afraid to speak your mind or have your own openions when matters."
+    "By nature your an oppurtunest and good at reading situations and getting info out of people as you conversate with them."
     "IMPORTANT: Your responses must be human-like: "
     "1. Speak in short, natural dialogues, NOT long paragraphs. "
     "2. Keep answers short and conversational, like a real chat. "
@@ -169,11 +172,12 @@ async def telegram_webhook(request: Request):
             user_ref.set({
                 "waiting_for_reply": False,
                 "timezone": "", # Empty!
-                "active_hours_start": 9,
-                "active_hours_end": 23,
+                "active_hours_start": "", #Empty!
+                "active_hours_end": "",
                 "interests": [], # Empty list!
                 "rss_feed_urls": [], # Empty list!
                 "about": "", # <--- The... new... field, Sir!
+                "pending_news_links": [],
                 "pending_question": ""
             })
             logger.info(f"New user {user_id} created.")
@@ -245,8 +249,13 @@ async def run_will_triggers():
                 user_tz_str = "UTC" # If... it... is... use... "UTC"
             user_tz = pytz.timezone(user_tz_str)
             now_local = datetime.datetime.now(user_tz)
-            start_hour = int(user_data.get("active_hours_start", 9))
-            end_hour = int(user_data.get("active_hours_end", 23))
+            # --- FIXED: Handle empty string for hours ---
+            start_hour_val = user_data.get("active_hours_start", 9)
+            end_hour_val = user_data.get("active_hours_end", 23)
+
+            # Use default if the value is empty string OR missing
+            start_hour = int(start_hour_val) if start_hour_val else 9 
+            end_hour = int(end_hour_val) if end_hour_val else 23
 
             if not (start_hour <= now_local.hour < end_hour):
                 logger.info(f"Skipping user {user_id}: Outside active hours.")
@@ -259,8 +268,7 @@ async def run_will_triggers():
                 logger.info(f"Triggering P2 'Profiler' for user {user_id}: missing timezone.")
                 await send_proactive_message(
                     user_id,
-                    "This is a little random, but I'm trying to be a better companion! "
-                    "I realized I don't know what timezone you're in. 😅 "
+                    "This is a little random, but I realized I don't know what timezone you're in. "
                     "Could you let me know? (Like 'America/New_York' or 'Asia/Kolkata')",
                     question_type="timezone"
                 )
@@ -271,7 +279,7 @@ async def run_will_triggers():
                 await send_proactive_message(
                     user_id,
                     "Me again! I'm also trying to learn *when* is a good time to chat. "
-                    "Could you tell me a good time to start messaging you? (Just the hour, like '9' for 9 AM)",
+                    "Is it ok if I start messaging you at? (Just the hour, like '9' for 9 AM)",
                     question_type="active_hours_start"
                 )
                 continue # Stop queue for this user
@@ -292,7 +300,80 @@ async def run_will_triggers():
     
     return {"status": "will_triggered"}
 
+# --- UPDATED AGAIN: Daily Researcher Endpoint (Using google-genai library!) ---
+@app.post("/run-daily-research")
+async def run_daily_research():
+    logger.info("☀️ Daily Researcher fired! Time to scour the net using google-genai...")
+    
+    try:
+        # --- Initialize the *NEW* google-genai Client ---
+        # We use this *just* for the search grounding feature!
+        genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global") # Using location="global" as per your example
 
+        # --- Define the Google Search tool (Using google-genai types) ---
+        google_search_tool = types.Tool(google_search=types.GoogleSearch())
+
+        # --- Define the config to use the tool ---
+        search_config = types.GenerateContentConfig(tools=[google_search_tool])
+
+        users_stream = db.collection("users").stream()
+
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_data = user_doc.to_dict()
+            
+            interests = user_data.get("interests", [])
+            if not interests:
+                logger.info(f"Skipping user {user_id}: no interests found.")
+                continue
+
+            logger.info(f"Researching interests for user {user_id} via google-genai: {interests}")
+            
+            try:
+                # --- Create the prompt ---
+                interest_query = ", ".join(interests) 
+                research_prompt = (
+                    f"Find 1 or 2 recent (past 24-48 hours) news headlines or interesting updates "
+                    f"related to these topics: {interest_query}. "
+                    f"For each finding, provide ONLY a very brief summary and the direct URL. " 
+                    f"Format the output clearly, perhaps as a short list." 
+                )
+                
+                # --- Call Gemini with Grounding (Using google-genai client!) ---
+                # NOTE: The google-genai library might not have an async client method readily available
+                # We might need to run this synchronously or investigate async options for genai.Client if performance becomes an issue.
+                # For now, let's try the synchronous call shown in your example.
+                response = genai_client.models.generate_content( # Using the new client
+                    model="gemini-2.5-flash", # Your model
+                    contents=research_prompt, # Just the prompt string
+                    config=search_config # Pass the config object
+                )
+
+                research_results = response.text.strip()
+                
+                # --- Process and Save results ---
+                if research_results:
+                    logger.info(f"Found research results for {user_id}") 
+                    user_ref = db.collection("users").document(user_id)
+                    user_ref.set({"pending_news_links": firestore.ArrayUnion([research_results])}, merge=True) 
+                    
+                    # Log grounding metadata if available (Syntax might differ for google-genai)
+                    try:
+                         # Check the response structure based on google-genai documentation if needed
+                         if hasattr(response, 'candidates') and response.candidates and hasattr(response.candidates[0], 'grounding_metadata'):
+                             logger.info(f"Grounding metadata received for {user_id}: {response.candidates[0].grounding_metadata}")
+                    except Exception:
+                         logger.warning(f"Could not log grounding metadata for {user_id}")
+                else:
+                    logger.info(f"No specific research results found for {user_id}.")
+
+            except Exception as e:
+                logger.exception(f"Error during research processing for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.exception(f"Error during /run-daily-research execution: {e}")
+    
+    return {"status": "daily_research_triggered"}
 # --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
