@@ -6,3 +6,4 @@ ngrok
 python-dotenv
 google-cloud-firestore
 pytz
+google-genai

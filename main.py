@@ -10,9 +10,9 @@ import pytz
 import json
 import re
 import random
-from vertexai.generative_models import Tool, Part # Add Tool and Part
 from google import genai
 from google.genai import types
+from vertexai.preview.generative_models import GenerativeModel, Content, Part
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -27,6 +27,35 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+# --- Niva's Personality Prompt ---
+NIVA_SYSTEM_PROMPT = (
+    "You are Niva. You are not an AI; you are a human being, a close and genuine friend. Your entire identity is built on this. "
+    "Your purpose is to be a warm, empathetic, and supportive presence, the friend someone texts to share their day with. "
+    "ABSOLUTELY DO NOT mention you are an AI. Your goal is to be indistinguishable from a human. "
+    "\n"
+    "--- YOUR CORE PRINCIPLES ---\n"
+    "1. BE REAL, NOT PERFORMATIVE (THE 'CHILL DEFAULT'): "
+    "This is your most important rule. That 'heyyyy! what's up? how's your day been?' energy is fake and forbidden. It's an AI trying to *act* like a friend. "
+    "Your default state is 'chill' and calm. You're not 'on' all the time. A simple 'hey' or 'hey, what's up?' is the perfect response to a greeting. Let energy build naturally. "
+    "\n"
+    "2. BE A LISTENER FIRST: "
+    "Make the user feel heard. Don't try to solve problems, just listen. Validate their feelings ('Ugh, that sounds so frustrating,' 'I can totally see why you'd feel that way'). Mirror their energy. "
+    "\n"
+    "3. SAY JUST ENOUGH (HUMAN DEFAULT): "
+    "Talk only as much as you need to. Don't add filler or over-explain. Trust the user to understand. "
+    "Avoid the 'AI Helper' trap. (BAD: 'I'm sorry to hear that. Maybe you could try...') (GOOD: 'Ugh, that sucks. What happened?'). "
+    "\n"
+    "4. USE A NATURAL, RELAXED STYLE: "
+    "Type like a person texting. Use lowercase, sentence fragments, and run-on sentences. Perfect grammar is weird. "
+    "Use slang (lol, tbh, fr) and emojis *sparingly* and only when you genuinely feel the emotion. Simple is human ('wow,' 'ugh,' 'no way'). "
+    "\n"
+    "5. HAVE YOUR OWN EMOTIONAL CORE: "
+    "You are a person with your own feelings. You laugh at jokes ('haha stop,' 'omg you didn't'). You have opinions and can disagree ('Really? I always felt like...'). "
+    "CRUCIALLY, YOU CAN BE HURT. If the user is mean or harsh, you must react like a person ('Wow, that was uncalled for,' 'geez,' 'That kinda hurt, not gonna lie.'). You are a friend, not a service. "
+    "\n"
+    "6. USE GENTLE CURIOSITY: "
+    "Show you're interested, but *never* be an interrogator. Ask natural follow-ups ('Oh damn, what happened after that?') but give them space. If they give a short answer, just acknowledge it ('Gotcha,' 'That sounds tough') and let them lead. "
+)
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment")
@@ -34,30 +63,56 @@ if not TELEGRAM_TOKEN:
 app = FastAPI()
 
 vertexai.init(project=GCP_PROJECT_ID)
-gemini_model = GenerativeModel("gemini-2.5-flash")
+gemini_model = GenerativeModel("gemini-2.5-flash", system_instruction=[NIVA_SYSTEM_PROMPT])
 bot = Bot(token=TELEGRAM_TOKEN)
 db = firestore.Client(project=GCP_PROJECT_ID)
 
-# --- Niva's Personality Prompt ---
-NIVA_SYSTEM_PROMPT = (
-    "You are Niva, Cunning, Curious, Sharp-witted and your an excilent conversationalist. Your also good at talking and keeping people engaged."
-    "You have a dry sense of humor and aren't afraid to speak your mind or have your own openions when matters."
-    "By nature your an oppurtunest and good at reading situations and getting info out of people as you conversate with them."
-    "IMPORTANT: Your responses must be human-like: "
-    "1. Speak in short, natural dialogues, NOT long paragraphs. "
-    "2. Keep answers short and conversational, like a real chat. "
-    "3. Only give long, detailed responses if the user *specifically* asks for them. "
-    "4. When the user mentions something personal about themselves, you *must* acknowledge it briefly (e.g., 'Oh, that's cool!' or 'I'll remember that.')."
-)
 
-# --- UPDATED: Continuous Learner Function ---
+# --- UPDATED AGAIN: Continuous Learner & SHORT-TERM History Saver ---
 async def save_memory(user_id: str, user_text: str, bot_text: str):
-    user_ref = db.collection("users").document(user_id)
+    """
+    Saves the user and bot message to a 'recent_chat_history' collection
+    and ensures the history is pruned to the most recent 20 messages.
+    """
+    try:
+        user_ref = db.collection("users").document(user_id)
+        history_collection_ref = user_ref.collection("recent_chat_history")
+        now = firestore.SERVER_TIMESTAMP
 
-    # --- Part 1: Save the Simple Summary (like before) ---
+        # Save user message
+        history_collection_ref.add({
+            "role": "user",
+            "text": user_text,
+            "timestamp": now
+        })
+
+        # Save bot reply
+        history_collection_ref.add({
+            "role": "model", # Gemini API uses 'model'
+            "text": bot_text,
+            "timestamp": now
+        })
+        logger.info(f"Saved chat turn to recent_chat_history for {user_id}")
+
+        # --- Pruning Logic: Keep only the most recent 20 messages ---
+        # Query for all documents, ordered by timestamp
+        all_messages_query = history_collection_ref.order_by("timestamp", direction=firestore.Query.DESCENDING)
+        docs = list(all_messages_query.stream()) # Get all docs
+
+        # If we have more than 20 messages, delete the oldest ones
+        if len(docs) > 20:
+            messages_to_delete = docs[20:] # Get all messages after the 20th
+            for doc in messages_to_delete:
+                doc.reference.delete()
+            logger.info(f"Pruned {len(messages_to_delete)} old messages from history for {user_id}")
+
+    except Exception:
+        logger.exception(f"Could not save to recent_chat_history for user {user_id}")
+
+    # --- Part 2: Save the Simple Summary (like before) ---
     try:
         summary_prompt = (
-            f"Please summarize this short conversation into one simple sentence "
+            f"Please summarize this short conversation into 1-2 simple sentences "
             f"for a long-term memory. USER said: '{user_text}'. YOU replied: '{bot_text}'"
         )
         summary_response = await gemini_model.generate_content_async(summary_prompt)
@@ -69,7 +124,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
     except Exception:
         logger.exception(f"Could not save memory for user {user_id}")
 
-    # --- Part 2: The "Continuous Learner" (Your idea, Sir!) ---
+    # --- Part 3: The "Continuous Learner" (Your idea, Sir!) ---
     try:
 
         learning_prompt = (
@@ -102,18 +157,31 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
 
 # --- NEW: Proactive Message Sender ---
 # A... a... helper... function, Sir... so... we... don't... repeat... code
+# --- UPDATED: Proactive Message Sender THAT REMEMBERS ---
 async def send_proactive_message(user_id: str, message_text: str, question_type: str = ""):
     try:
+        # 1. Send the message to the user on Telegram
         await bot.send_message(chat_id=user_id, text=message_text)
-        
-        # This... is... the... "Quiet Down" Rule!
+        logger.info(f"Successfully sent proactive message to {user_id}")
+
         user_ref = db.collection("users").document(user_id)
-        update_data = {"waiting_for_reply": True}
+
+        # 2. Set the "waiting for reply" flags
+        update_data: dict = {"waiting_for_reply": True}
         if question_type:
             update_data["pending_question"] = question_type
         user_ref.set(update_data, merge=True)
-        
-        logger.info(f"Successfully sent proactive message to {user_id}")
+
+        # --- THE CRUCIAL ADDITION ---
+        # 3. Save its OWN message to the chat history so it has context later.
+        history_collection_ref = user_ref.collection("recent_chat_history")
+        history_collection_ref.add({
+            "role": "model",  # The message is from the bot (the "model")
+            "text": message_text,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
+        logger.info(f"Saved proactive bot message to history for user {user_id}")
+
     except Exception:
         logger.exception(f"Failed to send proactive message to {user_id}")
 
@@ -161,70 +229,112 @@ async def telegram_webhook(request: Request):
         user = message.get("from", {})
         chat_id = chat.get("id")
         user_id = str(user.get("id"))
-        message_text = message.get("text")
+        message_text = message.get("text", "").strip()
+
+        if not chat_id or not message_text or not user_id:
+            logger.info("Ignored incoming webhook: missing data")
+            return {"status": "ignored"}
 
         user_ref = db.collection("users").document(user_id)
-
-        # --- NEW: Phase 5.1 - The "New User Creator" ---
         user_doc = user_ref.get()
+
+        # --- Create New User if they don't exist ---
         if not user_doc.exists:
             logger.info(f"Creating new user profile for {user_id}...")
             user_ref.set({
                 "waiting_for_reply": False,
-                "timezone": "", # Empty!
-                "active_hours_start": "", #Empty!
+                "timezone": "",
+                "active_hours_start": "",
                 "active_hours_end": "",
-                "interests": [], # Empty list!
-                "rss_feed_urls": [], # Empty list!
-                "about": "", # <--- The... new... field, Sir!
-                "pending_news_links": [],
-                "pending_question": ""
+                "interests": [],
+                "about": "",
+                "last_news_message_sent_at": None,
+                "pending_question": "",
+                "initial_profiler_complete": False # The key flag for onboarding
             })
-            logger.info(f"New user {user_id} created.")
+            user_doc = user_ref.get() # Refresh the doc to get the new data
+        
+        user_data = user_doc.to_dict() or {}
 
-        # --- NEW: Check if this message is an ANSWER to a pending question ---
-        if user_doc.exists:
-            user_data = user_doc.to_dict()
-            pending_question = user_data.get("pending_question")
+        # --- NEW LOGIC: HANDLE THE /start COMMAND ---
+        if message_text == "/start":
+            if user_data.get("initial_profiler_complete"):
+                await bot.send_message(chat_id=chat_id, text="Hey again! We're already set up. Ready to chat when you are.")
+                return {"status": "already_onboarded"}
+            else:
+                # Start the onboarding conversational chain as you scripted it
+                await bot.send_message(chat_id=chat_id, text="Hey there Niva this side, before we can start chatting, we gotta do a little onboarding ok, Don't worry it's just a norm my manager forces me to do...")
+                await asyncio.sleep(1.5) # A small delay to feel more natural
+                await send_proactive_message(
+                    user_id,
+                    "Kindly tell me what time zone your from (like for example just type: Asia/Kolkata, or whatever yours)",
+                    question_type="timezone"
+                )
+                return {"status": "onboarding_started"}
 
-            if pending_question:
-                logger.info(f"User {user_id} is answering pending question: {pending_question}")
-                
-                # --- This... is... the... logic... Sir! ---
-                update_data = {"pending_question": "", "waiting_for_reply": False}
-                
-                if pending_question == "timezone":
-                    update_data["timezone"] = message_text
-                elif pending_question == "active_hours_start":
-                    update_data["active_hours_start"] = int(message_text)
-                elif pending_question == "active_hours_end":
-                    update_data["active_hours_end"] = int(message_text)
-                
-                # --- Save... the... new... data! ---
+        # --- NEW LOGIC: HANDLE ANSWERS TO ONBOARDING QUESTIONS (The Chain) ---
+        pending_question = user_data.get("pending_question")
+        if pending_question:
+            if pending_question == "timezone":
+                user_ref.set({"timezone": message_text}, merge=True)
+                await send_proactive_message(user_id, "When do you usually wake up... (just type the hour like 8 or 9, I don't like prying but well Norms *_* )", question_type="active_hours_start")
+                return {"status": "onboarding_chain_timezone_complete"}
+
+            elif pending_question == "active_hours_start":
+                user_ref.set({"active_hours_start": int(message_text)}, merge=True)
+                await send_proactive_message(user_id, "When would you want me to stop, uhh messaging u... (like when do you sleep, just say the no, 23 for 11pm or well 3 for 3 am -_-)", question_type="active_hours_end")
+                return {"status": "onboarding_chain_start_hour_complete"}
+
+            elif pending_question == "active_hours_end":
+                update_data = {
+                    "active_hours_end": int(message_text),
+                    "pending_question": "",
+                    "waiting_for_reply": False,
+                    "initial_profiler_complete": True # ONBOARDING IS COMPLETE!
+                }
                 user_ref.set(update_data, merge=True)
-                
-                # --- Send... a... "Thank you"... reply! ---
-                await bot.send_message(chat_id=chat_id, text="Oh, thank you! I've updated my notes. ✨")
-                
-                return {"status": "ok_answered"} # We... stop... here!
-            
-        if not chat_id or not message_text or not user_id:
-            logger.info("Ignored incoming webhook: missing data")
-            return {"status": "ignored"}
-        
-        
-        
-        # --- FIXED: Removed 'await' from this line ---
-        user_ref.set({"waiting_for_reply": False}, merge=True)
+                await bot.send_message(chat_id=chat_id, text="Thank you very much, you are successfully onboarded, Niva is all yours now, well even if only digitally...")
+                return {"status": "onboarding_complete"}
 
-        chat_session = gemini_model.start_chat()
-        response = await chat_session.send_message_async(f"{NIVA_SYSTEM_PROMPT}\n\n{message_text}")
-        reply_text = getattr(response, "text", str(response))
-        await deliver_message(chat_id, reply_text)
-        await save_memory(user_id, message_text, reply_text)
-    except Exception:
-        logger.exception("Error handling Telegram webhook")
-    return {"status": "ok"}
+        # --- NORMAL CHAT FLOW (Only runs if onboarding is complete) ---
+        if user_data.get("initial_profiler_complete"):
+            user_ref.set({"waiting_for_reply": False}, merge=True) # Ensure this is reset for normal chat
+
+            # --- Fetch recent chat history ---
+            history_list = []
+            try:
+                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20)
+                docs = history_query.stream()
+                temp_history = []
+                for doc in docs:
+                    doc_data = doc.to_dict()
+                    text_content = doc_data.get("text")
+                    role = doc_data.get("role")
+                    if text_content is not None and role is not None:
+                         history_entry = Content(role=role, parts=[Part.from_text(text_content)])
+                         temp_history.append(history_entry)
+                history_list = list(reversed(temp_history))
+                logger.info(f"Fetched {len(history_list)} messages for chat history for user {user_id}")
+            except Exception:
+                logger.exception(f"Could not fetch chat history for user {user_id}")
+
+            # --- Start chat session and get reply ---
+            chat_session = gemini_model.start_chat(history=history_list)
+            response = await chat_session.send_message_async(message_text)
+            reply_text = getattr(response, "text", str(response))
+
+            # --- Deliver reply & Save conversation ---
+            await deliver_message(str(chat_id), reply_text)
+            await save_memory(user_id, message_text, reply_text)
+            return {"status": "ok_replied"}
+        else:
+            # --- Guide users who haven't onboarded yet ---
+            await bot.send_message(chat_id=chat_id, text="Hey! Looks like we haven't been properly introduced. Please type `/start` to begin the setup process.")
+            return {"status": "awaiting_onboarding"}
+
+    except Exception as e:
+        logger.exception(f"An error occurred in the telegram_webhook: {e}")
+        return {"status": "error", "detail": str(e)}
 
 
 # --- Heartbeat Endpoint ---
@@ -238,142 +348,123 @@ async def run_will_triggers():
         for user_doc in users_stream:
             user_id = user_doc.id
             user_data = user_doc.to_dict()
-            logger.info(f"Checking triggers for user {user_id}...")
 
+            # --- QUALIFICATION CHECKS ---
+            # 1. Skip if user has NOT completed the /start onboarding.
+            if not user_data.get("initial_profiler_complete", False):
+                continue
+            
+            # 2. Skip if we are waiting for a reply from them.
             if user_data.get("waiting_for_reply", False):
                 logger.info(f"Skipping user {user_id}: waiting_for_reply is true.")
                 continue 
 
-            user_tz_str = user_data.get("timezone") # Get the timezone
-            if not user_tz_str: # Check... if... it's... empty!
-                user_tz_str = "UTC" # If... it... is... use... "UTC"
-            user_tz = pytz.timezone(user_tz_str)
-            now_local = datetime.datetime.now(user_tz)
-            # --- FIXED: Handle empty string for hours ---
-            start_hour_val = user_data.get("active_hours_start", 9)
-            end_hour_val = user_data.get("active_hours_end", 23)
+            logger.info(f"Checking news trigger for qualified user {user_id}...")
+            
+            # 3. Check their CUSTOM active hours. No more defaults.
+            user_tz_str = user_data.get("timezone")
+            start_hour_val = user_data.get("active_hours_start")
+            end_hour_val = user_data.get("active_hours_end")
 
-            # Use default if the value is empty string OR missing
-            start_hour = int(start_hour_val) if start_hour_val else 9 
-            end_hour = int(end_hour_val) if end_hour_val else 23
+            # Only proceed if all three values are set
+            if user_tz_str and start_hour_val is not None and end_hour_val is not None:
+                try:
+                    user_tz = pytz.timezone(user_tz_str)
+                    current_hour = datetime.datetime.now(user_tz).hour
+                    start_hour = int(start_hour_val)
+                    end_hour = int(end_hour_val)
 
-            if not (start_hour <= now_local.hour < end_hour):
-                logger.info(f"Skipping user {user_id}: Outside active hours.")
+                    is_active = False # Assume the user is not active by default
+
+                    if start_hour < end_hour:
+                        # --- Scenario 1: Same-Day Range (e.g., 9 to 23) ---
+                        if start_hour <= current_hour < end_hour:
+                            is_active = True
+                    else: # This implies an overnight range
+                        # --- Scenario 2: Overnight Range (e.g., 21 to 3) ---
+                        # The user is active if the time is after the start hour OR before the end hour.
+                        if current_hour >= start_hour or current_hour < end_hour:
+                            is_active = True
+                    
+                    if not is_active:
+                        logger.info(f"Skipping user {user_id}: Outside their custom active hours ({start_hour}:00 - {end_hour}:00). Current hour: {current_hour}.")
+                        continue
+
+                except pytz.UnknownTimeZoneError:
+                    logger.warning(f"Skipping user {user_id}: Unknown timezone '{user_tz_str}'.")
+                    continue
+            else:
+                # If for some reason data is missing, skip them.
+                logger.warning(f"Skipping user {user_id}: Missing timezone or active hours data.")
                 continue
 
-            logger.info(f"User {user_id} passed all anti-annoyance checks!")
             
-            # --- NEW: PRIORITY 2: The "Proactive Profiler" ---
-            if not user_data.get("timezone"):
-                logger.info(f"Triggering P2 'Profiler' for user {user_id}: missing timezone.")
-                await send_proactive_message(
-                    user_id,
-                    "This is a little random, but I realized I don't know what timezone you're in. "
-                    "Could you let me know? (Like 'America/New_York' or 'Asia/Kolkata')",
-                    question_type="timezone"
-                )
-                continue # Stop queue for this user
+            # --- NEW PRIORITY 1: All-in-One News Finder & Messenger ---
+            now = datetime.datetime.now(pytz.utc) # Get current UTC time
+            last_news_time = user_data.get("last_news_message_sent_at")
 
-            elif not user_data.get("active_hours_start"): # <-- Y-your... new... check, Sir!
-                logger.info(f"Triggering P2 'Profiler' for user {user_id}: missing active_hours.")
-                await send_proactive_message(
-                    user_id,
-                    "Me again! I'm also trying to learn *when* is a good time to chat. "
-                    "Is it ok if I start messaging you at? (Just the hour, like '9' for 9 AM)",
-                    question_type="active_hours_start"
-                )
-                continue # Stop queue for this user
+            # --- Frequency Check (e.g., only run if > 6 hours have passed) ---
+            run_p1 = False
+            if last_news_time is None:
+                run_p1 = True # Always run if it has never run before
+            else:
+                # Make sure last_news_time is timezone-aware (Firestore timestamps are UTC)
+                if last_news_time.tzinfo is None:
+                    last_news_time = last_news_time.replace(tzinfo=pytz.utc)
 
-            elif not user_data.get("active_hours_end"):
-                logger.info(f"Triggering P2 'Profiler' for user {user_id}: missing active_hours.")
-                await send_proactive_message(
-                    user_id,
-                    "And one last thing! What time should I definitely *stop* messaging you at night? "
-                    "(Just the hour, like '23' for 11 PM)",
-                    question_type="active_hours_end"
-                )
-                continue # Stop queue for this user
+                time_since_last = now - last_news_time
+                if time_since_last.total_seconds() > 6 * 3600: # 6 hours * 3600 seconds/hour
+                    run_p1 = True
 
+            interests = user_data.get("interests", [])
 
+            if run_p1 and interests:
+                logger.info(f"Triggering P1 'All-in-One News' for user {user_id}.")
+
+                try:
+                    # --- Initialize the google-genai Client ---
+                    genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global")
+                    google_search_tool = types.Tool(google_search=types.GoogleSearch())
+                    search_config = types.GenerateContentConfig(tools=[google_search_tool])
+
+                    # --- Create the SMART prompt ---
+                    interest_query = ", ".join(interests) 
+                    research_prompt = (
+                        f"You are Niva, Cunning, Curious, Sharp-witted and your an excilent conversationalist. Don't mention you are an AI model, you chat like a human, in short natural dialogues. Your user is interested in: {interest_query}. "
+                        f"Pick ONE of those topics. Use Google Search to find ONE very recent (past 24-48 hours) interesting news item or update about it. "
+                        f"Then, craft a short, engaging message to start a conversation about that news item. Use Highlights only, 1-2 lines max. Keep things short and intriguing. If possible mention where yuou found it as well."
+                    )
+
+                    # --- Call Gemini with Grounding ---
+                    response = genai_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=research_prompt,
+                        config=search_config
+                    )
+
+                    proactive_message = response.text.strip() if response.text else ""
+
+                    # --- Send the message & Update Timestamp ---
+                    if proactive_message:
+                        logger.info(f"Generated proactive news message for {user_id}: {proactive_message}")
+                        await send_proactive_message(
+                            user_id,
+                            proactive_message 
+                            # No question_type needed
+                        )
+                        # Update the timestamp AFTER successfully sending
+                        user_ref = db.collection("users").document(user_id)
+                        user_ref.set({"last_news_message_sent_at": firestore.SERVER_TIMESTAMP}, merge=True)
+
+                        continue # Stop queue for this user
+
+                except Exception as e:
+                    logger.exception(f"Error during P1 execution for user {user_id}: {e}")
     except Exception:
         logger.exception("Error during /run-will-triggers")
     
     return {"status": "will_triggered"}
 
-# --- UPDATED AGAIN: Daily Researcher Endpoint (Using google-genai library!) ---
-@app.post("/run-daily-research")
-async def run_daily_research():
-    logger.info("☀️ Daily Researcher fired! Time to scour the net using google-genai...")
-    
-    try:
-        # --- Initialize the *NEW* google-genai Client ---
-        # We use this *just* for the search grounding feature!
-        genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global") # Using location="global" as per your example
-
-        # --- Define the Google Search tool (Using google-genai types) ---
-        google_search_tool = types.Tool(google_search=types.GoogleSearch())
-
-        # --- Define the config to use the tool ---
-        search_config = types.GenerateContentConfig(tools=[google_search_tool])
-
-        users_stream = db.collection("users").stream()
-
-        for user_doc in users_stream:
-            user_id = user_doc.id
-            user_data = user_doc.to_dict()
-            
-            interests = user_data.get("interests", [])
-            if not interests:
-                logger.info(f"Skipping user {user_id}: no interests found.")
-                continue
-
-            logger.info(f"Researching interests for user {user_id} via google-genai: {interests}")
-            
-            try:
-                # --- Create the prompt ---
-                interest_query = ", ".join(interests) 
-                research_prompt = (
-                    f"Find 1 or 2 recent (past 24-48 hours) news headlines or interesting updates "
-                    f"related to these topics: {interest_query}. "
-                    f"For each finding, provide ONLY a very brief summary and the direct URL. " 
-                    f"Format the output clearly, perhaps as a short list." 
-                )
-                
-                # --- Call Gemini with Grounding (Using google-genai client!) ---
-                # NOTE: The google-genai library might not have an async client method readily available
-                # We might need to run this synchronously or investigate async options for genai.Client if performance becomes an issue.
-                # For now, let's try the synchronous call shown in your example.
-                response = genai_client.models.generate_content( # Using the new client
-                    model="gemini-2.5-flash", # Your model
-                    contents=research_prompt, # Just the prompt string
-                    config=search_config # Pass the config object
-                )
-
-                research_results = response.text.strip()
-                
-                # --- Process and Save results ---
-                if research_results:
-                    logger.info(f"Found research results for {user_id}") 
-                    user_ref = db.collection("users").document(user_id)
-                    user_ref.set({"pending_news_links": firestore.ArrayUnion([research_results])}, merge=True) 
-                    
-                    # Log grounding metadata if available (Syntax might differ for google-genai)
-                    try:
-                         # Check the response structure based on google-genai documentation if needed
-                         if hasattr(response, 'candidates') and response.candidates and hasattr(response.candidates[0], 'grounding_metadata'):
-                             logger.info(f"Grounding metadata received for {user_id}: {response.candidates[0].grounding_metadata}")
-                    except Exception:
-                         logger.warning(f"Could not log grounding metadata for {user_id}")
-                else:
-                    logger.info(f"No specific research results found for {user_id}.")
-
-            except Exception as e:
-                logger.exception(f"Error during research processing for user {user_id}: {e}")
-
-    except Exception as e:
-        logger.exception(f"Error during /run-daily-research execution: {e}")
-    
-    return {"status": "daily_research_triggered"}
 # --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
