@@ -465,6 +465,82 @@ async def run_will_triggers():
     
     return {"status": "will_triggered"}
 
+    # --- !!! UPDATED: Daily Journal Endpoint !!! ---
+@app.post("/run-daily-journal")
+async def run_daily_journal():
+    logger.info("🌙 Daily Journal fired! Time to summarize the day...")
+    
+    try:
+        # --- Get UTC time for 24 hours ago ---
+        now_utc = datetime.datetime.now(pytz.utc)
+        twenty_four_hours_ago = now_utc - datetime.timedelta(days=1)
+        today_str = now_utc.strftime("%Y-%m-%d")
+
+        users_stream = db.collection("users").stream()
+
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_ref = user_doc.reference
+            logger.info(f"Processing daily journal for user {user_id}...")
+            
+            # 1. --- Get all memories from the last 24 hours ---
+            try:
+                memories_query = user_ref.collection("user_memories").where("created_at", ">=", twenty_four_hours_ago)
+                memories_docs = memories_query.stream()
+                
+                daily_texts = []
+                docs_to_delete = [] # Keep track of docs to delete
+                
+                for doc in memories_docs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("text"):
+                        daily_texts.append(doc_data.get("text"))
+                        docs_to_delete.append(doc.reference)
+                
+                if not daily_texts:
+                    logger.info(f"No new user_memories to journal for user {user_id}.")
+                    continue # Go to the next user
+
+                # 2. --- Combine and Summarize ---
+                full_day_text = "\n".join(daily_texts)
+                
+                journal_prompt = (
+                    "You are a helpful journal-keeper. Below is a raw list of all chat summaries "
+                    "from a user's day. Read them all and combine them into a single, concise "
+                    "journal entry. Focus on key events, important facts the user revealed, "
+                    "new interests, and anything the user specifically asked to remember. "
+                    "Ignore simple greetings or chatter. Format it as a neat journal entry.\n\n"
+                    f"RAW CHAT SUMMARIES:\n{full_day_text}"
+                )
+                
+                # Use our main async model for this
+                journal_response = await gemini_model.generate_content_async(journal_prompt)
+                daily_journal_entry = journal_response.text.strip()
+                
+                # 3. --- Save the new 'Day Memory' ---
+                journal_doc_ref = user_ref.collection("daily_memories").document(today_str) # <-- SETS THE NAME!
+                journal_doc_ref.set({
+                    "journal_text": daily_journal_entry,
+                    "created_at": firestore.SERVER_TIMESTAMP
+                }) # <-- USES .set()!
+                logger.info(f"Successfully saved new daily_memory for user {user_id}.")
+
+                # 4. --- *DELETE* the old summaries ---
+                # (This is best done in batches, but for a few docs a day, this is okay)
+                deleted_count = 0
+                for doc_ref in docs_to_delete:
+                    doc_ref.delete()
+                    deleted_count += 1
+                logger.info(f"Successfully deleted {deleted_count} old user_memories for {user_id}.")
+
+            except Exception as e:
+                logger.exception(f"Error processing journal for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.exception("Error during /run-daily-journal execution: {e}")
+    
+    return {"status": "daily_journal_triggered"}
+
 # --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
