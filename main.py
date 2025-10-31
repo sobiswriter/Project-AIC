@@ -377,6 +377,8 @@ async def telegram_webhook(request: Request):
 
             return {"status": "ok_rem_command"} # We... are... *done*!
 
+            # --- NEW: Normal Chat Logic (moved outside /rem if) ---
+        if user_data.get("initial_profiler_complete"):
             # --- Fetch recent chat history ---
             history_list = []
             try:
@@ -388,8 +390,8 @@ async def telegram_webhook(request: Request):
                     text_content = doc_data.get("text")
                     role = doc_data.get("role")
                     if text_content is not None and role is not None:
-                         history_entry = Content(role=role, parts=[Part.from_text(text_content)])
-                         temp_history.append(history_entry)
+                        history_entry = Content(role=role, parts=[Part.from_text(text_content)])
+                        temp_history.append(history_entry)
                 history_list = list(reversed(temp_history))
                 logger.info(f"Fetched {len(history_list)} messages for chat history for user {user_id}")
             except Exception:
