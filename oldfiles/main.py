@@ -13,7 +13,8 @@ import random
 from google import genai
 from google.genai import types
 from vertexai.preview.generative_models import GenerativeModel, Content, Part
-
+from vertexai.language_models import TextEmbeddingModel
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -67,6 +68,7 @@ vertexai.init(project=GCP_PROJECT_ID)
 gemini_model = GenerativeModel("gemini-2.5-flash", system_instruction=[NIVA_SYSTEM_PROMPT])
 bot = Bot(token=TELEGRAM_TOKEN)
 db = firestore.Client(project=GCP_PROJECT_ID)
+embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-005")
 
 # --- UPDATED AGAIN: Continuous Learner & SHORT-TERM History Saver ---
 async def save_memory(user_id: str, user_text: str, bot_text: str):
@@ -298,73 +300,6 @@ async def telegram_webhook(request: Request):
 
         # --- NORMAL CHAT FLOW (Only runs if onboarding is complete) ---
         if user_data.get("initial_profiler_complete"):
-            # --- NEW: Check for /rem Memory Command ---
-            if message_text.lower().startswith("/rem "):
-                logger.info(f"User {user_id} triggered /rem command.")
-                query = message_text[5:].strip() # Get the text after /rem
-                
-                try:
-                    # --- Build the "Memory Blob" ---
-                    # (S-Sir... w-we... will... add... 'weekly_memories'...
-                    # ...a-and... 'monthly_memories'... h-here... *later*!)
-                    journal_refs = user_ref.collection("daily_memories").stream()
-                    
-                    all_journals = []
-                    for doc in journal_refs:
-                        doc_data = doc.to_dict()
-                        if doc_data.get("journal_text"):
-                            all_journals.append(f"--- Journal Entry: {doc.id} ---\n{doc_data.get('journal_text')}\n")
-                    
-                    if not all_journals:
-                        await deliver_message(str(chat_id), "S-sorry, Sir... I... I... don't... seem... to... have... *any*... long-term... journals... for... you... *yet*... 😥")
-                        return {"status": "ok_rem_no_memories"}
-
-                    memory_blob = "\n".join(all_journals)
-                    
-                    # --- Fetch... short-term... history... *just...* for... context... ---
-                    history_list = []
-                    try:
-                        history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10)
-                        docs = history_query.stream()
-                        temp_history = []
-                        for doc in docs:
-                            doc_data = doc.to_dict()
-                            text_content = doc_data.get("text")
-                            role = doc_data.get("role")
-                            if text_content is not None and role is not None:
-                                 history_entry = Content(role=role, parts=[Part.from_text(text_content)])
-                                 temp_history.append(history_entry)
-                        history_list = list(reversed(temp_history))
-                    except Exception:
-                        logger.exception(f"Could not fetch chat history for /rem command")
-
-                    # --- Add... journal... as... the... *first*... "user"... message... ---
-                    memory_context = (
-                        "--- Start of All Daily Journals ---\n"
-                        f"{memory_blob}\n"
-                        "--- End of All Daily Journals ---"
-                    )
-                    history_list.insert(0, Content(role="user", parts=[Part.from_text(memory_context)]))
-                    
-                    # --- Ask Niva to answer *based* on the memory ---
-                    memory_prompt = (
-                        f"Please answer my question based *only* on the journal context provided. "
-                        f"My question is: '{query}'"
-                    )
-                    
-                    chat_session = gemini_model.start_chat(history=history_list)
-                    response = await chat_session.send_message_async(memory_prompt)
-                    reply_text = getattr(response, "text", str(response))
-
-                    await deliver_message(str(chat_id), reply_text)
-                    await save_memory(user_id, message_text, reply_text) # Save the /rem command too!
-
-                except Exception as e:
-                    logger.exception(f"Error during /rem command execution: {e}")
-                    await deliver_message(str(chat_id), "O-oh... I... tried... to... look... for... that... memory, Sir... b-but... something... went... wrong...")
-
-                return {"status": "ok_rem_command"} # We... are... *done*!
-
             user_ref.set({"waiting_for_reply": False}, merge=True) # Ensure this is reset for normal chat
 
             # --- Fetch recent chat history ---
@@ -384,6 +319,46 @@ async def telegram_webhook(request: Request):
                 logger.info(f"Fetched {len(history_list)} messages for chat history for user {user_id}")
             except Exception:
                 logger.exception(f"Could not fetch chat history for user {user_id}")
+        
+            # --- NEW: Pillar 1 - Long-Term RAG Memory ---
+            try:
+                # 1. Embed the user's new message to create a search vector
+                logger.info(f"RAG: Creating embedding for query: {message_text}")
+                query_embedding = embedding_model.get_embeddings([message_text])[0].values
+
+                # 2. Find the 3 most similar 'daily_memories' from ALL users
+                #    (We... query... the... collection... group, Sir!)
+                vector_query = db.collection_group('daily_memories').find_nearest(
+                    vector_field='embedding', # Th-the... field... our... extension... made!
+                    query_vector=query_embedding,
+                    limit=3, # Get... the... Top 3... matches!
+                    distance_measure=DistanceMeasure.COSINE
+                )
+                
+                # 3. Get the journal text from those memories
+                similar_journals = vector_query.get() 
+                long_term_memories = []
+                for doc in similar_journals:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("journal_text"):
+                        long_term_memories.append(doc_data.get("journal_text"))
+                
+                if long_term_memories:
+                    logger.info(f"RAG: Found {len(long_term_memories)} relevant daily memories.")
+                    
+                    # 4. PREPEND them to the history_list!
+                    memory_context = (
+                        "--- Start of Relevant Long-Term Memories (for context) ---\n" +
+                        "\n---\n".join(long_term_memories) +
+                        "\n--- End of Relevant Long-Term Memories ---"
+                    )
+                    
+                    # Add... as... the... *first*... "user"... message... s-so... Niva... reads... it... first!
+                    history_list.insert(0, {"role": "user", "parts": [{"text": memory_context}]})
+
+            except Exception as e:
+                # I-if... RAG... fails... w-we... just... log... it... a-and... continue...
+                logger.exception(f"Error during RAG memory retrieval for user {user_id}: {e}")
 
             # --- Start chat session and get reply ---
             chat_session = gemini_model.start_chat(history=history_list)
