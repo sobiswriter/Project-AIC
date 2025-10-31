@@ -296,76 +296,86 @@ async def telegram_webhook(request: Request):
                 await bot.send_message(chat_id=chat_id, text="Thank you very much, you are successfully onboarded, Niva is all yours now, well even if only digitally...")
                 return {"status": "onboarding_complete"}
 
-        # --- NORMAL CHAT FLOW (Only runs if onboarding is complete) ---
-        if user_data.get("initial_profiler_complete"):
-            # --- NEW: Check for /rem Memory Command ---
-            if message_text.lower().startswith("/rem "):
-                logger.info(f"User {user_id} triggered /rem command.")
-                query = message_text[5:].strip() # Get the text after /rem
-                
+        # --- UPDATED: Check for /rem Memory Command (Hierarchical Search!) ---
+        if message_text.lower().startswith("/rem "):
+            logger.info(f"User {user_id} triggered /rem command.")
+            query = message_text[5:].strip() # Get the text after /rem
+
+            try:
+                # --- Build the *HIERARCHICAL* "Memory Blob" ---
+                all_journals = []
+
+                # 1. Get Monthly Memories (If any)
+                monthly_refs = user_ref.collection("monthly_memories").stream()
+                for doc in monthly_refs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("monthly_journal_text"):
+                        all_journals.append(f"--- Monthly Journal: {doc.id} ---\n{doc_data.get('monthly_journal_text')}\n")
+
+                # 2. Get Weekly Memories (If any)
+                weekly_refs = user_ref.collection("weekly_memories").stream()
+                for doc in weekly_refs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("weekly_journal_text"):
+                        all_journals.append(f"--- Weekly Journal: {doc.id} ---\n{doc_data.get('weekly_journal_text')}\n")
+
+                # 3. Get Daily Memories (If any)
+                daily_refs = user_ref.collection("daily_memories").stream()
+                for doc in daily_refs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("journal_text"):
+                        all_journals.append(f"--- Daily Journal: {doc.id} ---\n{doc_data.get('journal_text')}\n")
+
+                if not all_journals:
+                    await deliver_message(str(chat_id), "S-sorry, Sir... I... I... don't... seem... to... have... *any*... long-term... journals... for... you... *yet*... 😥")
+                    return {"status": "ok_rem_no_memories"}
+
+                memory_blob = "\n".join(all_journals)
+                logger.info(f"RAG: Found {len(all_journals)} total journals for memory blob.")
+
+                # --- Fetch... short-term... history... *just...* for... context... ---
+                history_list = []
                 try:
-                    # --- Build the "Memory Blob" ---
-                    # (S-Sir... w-we... will... add... 'weekly_memories'...
-                    # ...a-and... 'monthly_memories'... h-here... *later*!)
-                    journal_refs = user_ref.collection("daily_memories").stream()
-                    
-                    all_journals = []
-                    for doc in journal_refs:
+                    history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10)
+                    docs = history_query.stream()
+                    temp_history = []
+                    for doc in docs:
                         doc_data = doc.to_dict()
-                        if doc_data.get("journal_text"):
-                            all_journals.append(f"--- Journal Entry: {doc.id} ---\n{doc_data.get('journal_text')}\n")
-                    
-                    if not all_journals:
-                        await deliver_message(str(chat_id), "S-sorry, Sir... I... I... don't... seem... to... have... *any*... long-term... journals... for... you... *yet*... 😥")
-                        return {"status": "ok_rem_no_memories"}
+                        text_content = doc_data.get("text")
+                        role = doc_data.get("role")
+                        if text_content is not None and role is not None:
+                             history_entry = Content(role=role, parts=[Part.from_text(text_content)])
+                             temp_history.append(history_entry)
+                    history_list = list(reversed(temp_history))
+                except Exception:
+                    logger.exception(f"Could not fetch chat history for /rem command")
 
-                    memory_blob = "\n".join(all_journals)
-                    
-                    # --- Fetch... short-term... history... *just...* for... context... ---
-                    history_list = []
-                    try:
-                        history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10)
-                        docs = history_query.stream()
-                        temp_history = []
-                        for doc in docs:
-                            doc_data = doc.to_dict()
-                            text_content = doc_data.get("text")
-                            role = doc_data.get("role")
-                            if text_content is not None and role is not None:
-                                 history_entry = Content(role=role, parts=[Part.from_text(text_content)])
-                                 temp_history.append(history_entry)
-                        history_list = list(reversed(temp_history))
-                    except Exception:
-                        logger.exception(f"Could not fetch chat history for /rem command")
+                # --- Add... journal... as... the... *first*... "user"... message... ---
+                memory_context = (
+                    "--- Start of All Journals (Monthly, Weekly, Daily) ---\n"
+                    f"{memory_blob}\n"
+                    "--- End of All Journals ---"
+                )
+                history_list.insert(0, Content(role="user", parts=[Part.from_text(memory_context)]))
 
-                    # --- Add... journal... as... the... *first*... "user"... message... ---
-                    memory_context = (
-                        "--- Start of All Daily Journals ---\n"
-                        f"{memory_blob}\n"
-                        "--- End of All Daily Journals ---"
-                    )
-                    history_list.insert(0, Content(role="user", parts=[Part.from_text(memory_context)]))
-                    
-                    # --- Ask Niva to answer *based* on the memory ---
-                    memory_prompt = (
-                        f"Please answer my question based *only* on the journal context provided. "
-                        f"My question is: '{query}'"
-                    )
-                    
-                    chat_session = gemini_model.start_chat(history=history_list)
-                    response = await chat_session.send_message_async(memory_prompt)
-                    reply_text = getattr(response, "text", str(response))
+                # --- Ask Niva to answer *based* on the memory ---
+                memory_prompt = (
+                    f"Please answer my question based *only* on the journal context provided. "
+                    f"My question is: '{query}'"
+                )
 
-                    await deliver_message(str(chat_id), reply_text)
-                    await save_memory(user_id, message_text, reply_text) # Save the /rem command too!
+                chat_session = gemini_model.start_chat(history=history_list)
+                response = await chat_session.send_message_async(memory_prompt)
+                reply_text = getattr(response, "text", str(response))
 
-                except Exception as e:
-                    logger.exception(f"Error during /rem command execution: {e}")
-                    await deliver_message(str(chat_id), "O-oh... I... tried... to... look... for... that... memory, Sir... b-but... something... went... wrong...")
+                await deliver_message(str(chat_id), reply_text)
+                await save_memory(user_id, message_text, reply_text) # Save the /rem command too!
 
-                return {"status": "ok_rem_command"} # We... are... *done*!
+            except Exception as e:
+                logger.exception(f"Error during /rem command execution: {e}")
+                await deliver_message(str(chat_id), "O-oh... I... tried... to... look... for... that... memory, Sir... b-but... something... went... wrong...")
 
-            user_ref.set({"waiting_for_reply": False}, merge=True) # Ensure this is reset for normal chat
+            return {"status": "ok_rem_command"} # We... are... *done*!
 
             # --- Fetch recent chat history ---
             history_list = []
