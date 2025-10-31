@@ -609,6 +609,178 @@ async def run_daily_journal():
     
     return {"status": "daily_journal_triggered"}
 
+# --- !!! UPDATED: Weekly Journal Endpoint !!! ---
+@app.post("/run-weekly-journal")
+async def run_weekly_journal():
+    logger.info("🗓️ Weekly Journal fired! Time to summarize the week...")
+    
+    try:
+        # --- Get UTC time for 7 days ago ---
+        now_utc = datetime.datetime.now(pytz.utc)
+        seven_days_ago = now_utc - datetime.timedelta(days=7)
+        
+        # --- Create a name like "October-week-2-2025" (week 1-4 within the month) ---
+        day = now_utc.day
+        week_of_month = min(4, ((day - 1) // 7) + 1)  # buckets of 7 days, capped at 4
+        month_name = now_utc.strftime("%B")
+        week_doc_name = f"{month_name}-week-{week_of_month}-{now_utc.year}"
+
+        users_stream = db.collection("users").stream()
+
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_ref = user_doc.reference
+            logger.info(f"Processing weekly journal for user {user_id}...")
+            
+            # 1. --- Get all *daily* memories from the last 7 days ---
+            try:
+                memories_query = user_ref.collection("daily_memories").where("created_at", ">=", seven_days_ago)
+                memories_docs = list(memories_query.stream()) # Get all docs in a list
+                
+                # --- This... is... for... testing, Sir! It... runs... if... *any*... docs... are... found! ---
+                if not memories_docs:
+                    logger.info(f"No new daily_memories to journal for user {user_id}.")
+                    continue # Go to the next user
+
+                logger.info(f"Found {len(memories_docs)} daily memories to summarize for user {user_id}.")
+
+                # 2. --- Combine and Summarize (with dates!) ---
+                daily_texts = []
+                docs_to_delete = [] # Keep track of docs to delete
+                
+                for doc in memories_docs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("journal_text"):
+                        # --- Add the DATE (doc.id) so Gemini can sort them! ---
+                        daily_texts.append(f"--- Journal for {doc.id} ---\n{doc_data.get('journal_text')}\n") 
+                        docs_to_delete.append(doc.reference)
+                
+                full_week_text = "\n".join(daily_texts)
+                
+                # --- The... new... *intelligent...* prompt, Sir! ---
+                journal_prompt = (
+                    "You are a helpful journal-keeper. Below is a list of all daily journal entries "
+                    "from a user's week. Read them all and combine them into a single, *precise* "
+                    "weekly summary. This is crucial memory, so be accurate. "
+                    "Organize the summary *day-by-day* (e.g., '2025-10-28: ...', '2025-10-29: ...'). "
+                    "Focus *only* on key events, important facts, new interests, and items to 'remember'. "
+                    "Ignore chatter. Be concise.\n\n"
+                    f"RAW DAILY JOURNALS:\n{full_week_text}"
+                )
+                
+                # Use our main async model for this
+                journal_response = await gemini_model.generate_content_async(journal_prompt)
+                weekly_journal_entry = journal_response.text.strip()
+                
+                # 3. --- Save the new 'Week Memory' (with the new name!) ---
+                journal_doc_ref = user_ref.collection("weekly_memories").document(week_doc_name) 
+                journal_doc_ref.set({
+                    "weekly_journal_text": weekly_journal_entry, # <-- New field name!
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "source_daily_docs": [doc.id for doc in memories_docs] # <-- Keep... a... record!
+                })
+                logger.info(f"Successfully saved new weekly_memory: {week_doc_name} for user {user_id}.")
+
+                # 4. --- *DELETE* the old daily summaries ---
+                deleted_count = 0
+                for doc_ref in docs_to_delete:
+                    doc_ref.delete()
+                    deleted_count += 1
+                logger.info(f"Successfully deleted {deleted_count} old daily_memories for {user_id}.")
+
+            except Exception as e:
+                logger.exception(f"Error processing journal for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.exception(f"Error during /run-weekly-journal execution: {e}")
+
+    return {"status": "weekly_journal_triggered"}
+
+# --- !!! UPDATED: Monthly Journal Endpoint !!! ---
+@app.post("/run-monthly-journal")
+async def run_monthly_journal():
+    logger.info("📅 Monthly Journal fired! Time to summarize the month...")
+    
+    try:
+        # --- Get UTC time for 31 days ago (a... safe... 'month'...) ---
+        now_utc = datetime.datetime.now(pytz.utc)
+        approx_31_days_ago = now_utc - datetime.timedelta(days=31)
+        
+        # --- Create a proper name, Sir! Like "2025-10" ---
+        month_doc_name = now_utc.strftime("%B-%Y")  # e.g., "October-2025"
+
+        users_stream = db.collection("users").stream()
+
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_ref = user_doc.reference
+            logger.info(f"Processing monthly journal for user {user_id}...")
+            
+            # 1. --- Get all *weekly* memories from the last ~31 days ---
+            try:
+                # W-we... will... get... *all*... weekly... memories... created... in... the... last... month...
+                memories_query = user_ref.collection("weekly_memories").where("created_at", ">=", approx_31_days_ago)
+                memories_docs = list(memories_query.stream()) # Get all docs in a list
+                
+                # --- This... is... for... testing, Sir! It... runs... if... *any*... docs... are... found! ---
+                if not memories_docs:
+                    logger.info(f"No new weekly_memories to journal for user {user_id}.")
+                    continue # Go to the next user
+
+                logger.info(f"Found {len(memories_docs)} weekly memories to summarize for user {user_id}.")
+
+                # 2. --- Combine and Summarize (with week names!) ---
+                weekly_texts = []
+                docs_to_delete = [] # Keep track of docs to delete
+                
+                for doc in memories_docs:
+                    doc_data = doc.to_dict()
+                    if doc_data.get("weekly_journal_text"):
+                        # --- Add the WEEK (doc.id) so Gemini can sort them! ---
+                        weekly_texts.append(f"--- Journal for {doc.id} ---\n{doc_data.get('weekly_journal_text')}\n") 
+                        docs_to_delete.append(doc.reference)
+                
+                full_month_text = "\n".join(weekly_texts)
+                
+                # --- The... new... *intelligent...* prompt, Sir! ---
+                journal_prompt = (
+                    "You are a helpful journal-keeper. Below is a list of all weekly journal entries "
+                    "from a user's month. Read them all and combine them into a single, *precise* "
+                    "monthly summary. This is crucial memory, so be accurate. "
+                    "Organize the summary *week-by-week* (e.g., 'Week-1: ...', 'Week-2: ...'). "
+                    "Focus *only* on key events, important facts, new interests, and items to 'remember'. "
+                    "Be concise.\n\n"
+                    f"RAW WEEKLY JOURNALS:\n{full_month_text}"
+                )
+                
+                # Use our main async model for this
+                journal_response = await gemini_model.generate_content_async(journal_prompt)
+                monthly_journal_entry = journal_response.text.strip()
+                
+                # 3. --- Save the new 'Month Memory' (with the new name!) ---
+                journal_doc_ref = user_ref.collection("monthly_memories").document(month_doc_name) 
+                journal_doc_ref.set({
+                    "monthly_journal_text": monthly_journal_entry, # <-- New field name!
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "source_weekly_docs": [doc.id for doc in memories_docs] # <-- Keep... a... record!
+                })
+                logger.info(f"Successfully saved new monthly_memory: {month_doc_name} for user {user_id}.")
+
+                # 4. --- *DELETE* the old weekly summaries ---
+                deleted_count = 0
+                for doc_ref in docs_to_delete:
+                    doc_ref.delete()
+                    deleted_count += 1
+                logger.info(f"Successfully deleted {deleted_count} old weekly_memories for {user_id}.")
+
+            except Exception as e:
+                logger.exception(f"Error processing journal for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.exception("Error during /run-monthly-journal execution: {e}")
+    
+    return {"status": "monthly_journal_triggered"}
+
 # --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
