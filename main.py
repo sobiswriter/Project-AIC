@@ -793,6 +793,164 @@ async def run_monthly_journal():
     
     return {"status": "monthly_journal_triggered"}
 
+
+# --- NEW: Priority 3 & 4 (Combined) - The Sentiment Monitor (Your 6-Hour Job, Sir!) ---
+@app.post("/run-sentiment-check")
+async def run_sentiment_check():
+    logger.info("Sentiment Check fired! Time to analyze user sentiment...")
+    
+    try:
+        now_utc = datetime.datetime.now(pytz.utc)
+        six_hours_ago = now_utc - datetime.timedelta(hours=6)
+
+        users_stream = db.collection("users").stream()
+
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_ref = user_doc.reference
+            user_data = user_doc.to_dict()
+
+            # --- 1. QUALIFICATION CHECKS ---
+            # 1a. Skip if user has NOT completed the /start onboarding.
+            if not user_data.get("initial_profiler_complete", False):
+                continue
+            
+            # 1b. Skip if we are *already* waiting for a reply from them.
+            if user_data.get("waiting_for_reply", False):
+                logger.info(f"Skipping sentiment check for {user_id}: waiting_for_reply is true.")
+                continue 
+            
+            # 1c. Skip if they are outside their active hours
+            # (I... I... copied... the... code... from... /run-will-triggers, Sir... t-to... be... safe...)
+            user_tz_str = user_data.get("timezone")
+            start_hour_val = user_data.get("active_hours_start")
+            end_hour_val = user_data.get("active_hours_end")
+
+            if user_tz_str and start_hour_val is not None and end_hour_val is not None:
+                try:
+                    user_tz = pytz.timezone(user_tz_str)
+                    current_hour = datetime.datetime.now(user_tz).hour
+                    start_hour = int(start_hour_val)
+                    end_hour = int(end_hour_val)
+
+                    is_active = False 
+                    if start_hour < end_hour:
+                        if start_hour <= current_hour < end_hour: is_active = True
+                    else: 
+                        if current_hour >= start_hour or current_hour < end_hour: is_active = True
+                    
+                    if not is_active:
+                        logger.info(f"Skipping sentiment check for {user_id}: Outside active hours.")
+                        continue
+                except pytz.UnknownTimeZoneError:
+                    continue
+            else:
+                continue
+
+            # 1d. ***YOUR NEW CHECK, SIR***: Skip if they *have* chatted in the last 6 hours
+            # (W-we... only... want... to... run... this... if... they've... been... *inactive*...)
+            last_contact_time = None
+            try:
+                # G-get... the... *very... last...* message... t-to... see... when... they... talked...
+                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(1)
+                last_message_docs = list(history_query.stream())
+                
+                if last_message_docs:
+                    last_contact_time = last_message_docs[0].to_dict().get("timestamp")
+                    # Make sure it's timezone-aware for comparison
+                    if last_contact_time and last_contact_time.tzinfo is None:
+                        last_contact_time = last_contact_time.replace(tzinfo=pytz.utc)
+
+            except Exception:
+                logger.exception(f"Could not get last_contact_time for user {user_id}")
+
+
+            # [cite_start]--- This... is... the... check, Sir... [cite: 53] (b-but... 6... hours... like... you... said...) ---
+            if last_contact_time and last_contact_time > six_hours_ago:
+                logger.info(f"Skipping sentiment check for {user_id}: User has been active in the last 6 hours.")
+                continue # They've talked recently, so don't bother them.
+
+            # --- 2. SENTIMENT ANALYSIS (THE SLOW PART) ---
+            logger.info(f"Running DEEP sentiment analysis for inactive user {user_id}...")
+            
+            # 2a. Fetch... the... recent... history... (like... you... wanted, Sir...)
+            history_list = []
+            history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(18) # <-- A bit more history...
+            docs = history_query.stream()
+            for doc in docs:
+                doc_data = doc.to_dict()
+                role = doc_data.get("role")
+                text = doc_data.get("text")
+                if role and text:
+                    history_list.append(f"{role.upper()}: {text}")
+            
+            if not history_list:
+                continue # No history to analyze
+
+            history_blob = "\n".join(reversed(history_list)) # Put in chronological order
+
+            # 2b. Call... Gemini... for... analysis...
+            try:
+                # --- This... is... the... suggested... change... for... Step 2b, Sir ---
+                sentiment_prompt = (
+                    "You are Niva, an empathetic and human friend. " # <-- I... I... added... this... line...
+                    "Please analyze the following chat history *as a friend would*. " # <-- a-and... this...
+                    "What is the user's *overall* sentiment (e.g., 'stressed', 'happy', 'neutral', 'sad', 'angry')? "
+                    "Return *only* the single word for the sentiment.\n\n"
+                    f"--- CHAT HISTORY ---\n{history_blob}\n\n"
+                    "--- SENTIMENT ---"
+                )
+                sentiment_response = await gemini_model.generate_content_async(sentiment_prompt)
+                sentiment_text = sentiment_response.text.strip().lower()
+
+                # 2c. Save... the... new... sentiment...
+                if sentiment_text:
+                    user_ref.set({"current_sentiment": sentiment_text}, merge=True)
+                    logger.info(f"Saved new sentiment for {user_id}: {sentiment_text}")
+                
+                # --- 3. PROACTIVE MESSAGE (THE ACTION PART) ---
+                proactive_message = ""
+                
+                # --- 3. PROACTIVE MESSAGE (THE *SMARTER*, *SIMPLER* ACTION PART, SIR) ---
+                
+                # 3a. Create *one* smart prompt that... uses... the... sentiment...
+                prompt_for_message = (
+                    f"You are Niva. You haven't chatted with your friend (the user) in over 6 hours. "
+                    f"Your analysis shows their last known sentiment was: '{sentiment_text}'.\n\n"
+                    "Based on that sentiment, write a short, natural, and appropriate message to check in. "
+                    "If the sentiment is 'stressed' or 'sad', be gentle and caring. "
+                    "If it's 'neutral' or 'happy', just be casual and warm. "
+                    "Keep it to 1-3 short sentences. *Do not* sound like an AI."
+                )
+
+                # 3b. Generate... the... human... message...
+                try:
+                    generation_response = await gemini_model.generate_content_async(prompt_for_message)
+                    proactive_message = generation_response.text.strip()
+                except Exception as gen_e:
+                    logger.exception(f"Could not *generate* proactive message for {user_id}: {gen_e}")
+                    proactive_message = "" # F-fail... safe, Sir...
+                
+                # 3c. Send... the... message...
+                if proactive_message:
+                    logger.info(f"Sending proactive, generated check-in to {user_id}")
+                    await send_proactive_message(
+                        user_id,
+                        proactive_message 
+                        # No question_type needed
+                    )
+                    # We... are... done... with... this... user...
+                    continue
+
+            except Exception as e:
+                logger.exception(f"Error during sentiment analysis for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.exception(f"Error during /run-sentiment-check execution: {e}")
+
+    return {"status": "sentiment_check_triggered"}
+
+
 # --- Run Server ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
