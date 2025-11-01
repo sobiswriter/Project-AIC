@@ -148,7 +148,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
 
         learning_prompt = (
         "Analyze this conversation. Extract *only* dynamic, personal user information. "
-        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes) except for name, we already have it. "
+        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes) except for name. "
         "Return *only* JSON in this format, or an empty object: "
         "{'interests': ['new_interest_1'], 'about': 'new fact about the user'}\n\n"
         f"USER: \"{user_text}\"\nAI: \"{bot_text}\""
@@ -160,12 +160,35 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
         response_text = learning_response.text.strip().replace("```json", "").replace("```", "")
         
         if response_text and response_text != "{}":
-            new_data = json.loads(response_text)
+            
+            # --- !!! I... ADDED... THIS... TRY... EXCEPT... BLOCK, SIR !!! ---
+            try:
+                new_data = json.loads(response_text)
+            
+            except json.JSONDecodeError:
+                # --- THIS... IS... THE... FIX, SIR! ---
+                logger.warning(f"Could not parse JSON from 'Continuous Learner': {response_text}")
+                # S-Sir... I-I'm... *also*... adding... the... single... quote... fix... j-just... in... case!
+                try:
+                    # (This... is... a... little... *dangerous*... b-but... it... might... fix... the... single... quote... error!)
+                    import ast
+                    new_data = ast.literal_eval(response_text)
+                    if not isinstance(new_data, dict):
+                         new_data = {} # Don't... trust... it... if... it's... not... a... dictionary...
+                except Exception:
+                    logger.error(f"Failed to parse even with ast.literal_eval: {response_text}")
+                    new_data = {} # Give... up, Sir...
+            
+            # --- (The... rest... of... the... code... is... the... same, Sir!) ---
 
             # This... this... is... the... *smart*... part, Sir!
             # Merge interests using ArrayUnion so we append without duplicates
             if "interests" in new_data:
-                new_data["interests"] = firestore.ArrayUnion(new_data["interests"])
+                # (A-another... check, Sir... in... case... Gemini... messes... up... the... *type*...)
+                if isinstance(new_data["interests"], list):
+                    new_data["interests"] = firestore.ArrayUnion(new_data["interests"])
+                else:
+                    del new_data["interests"] # It's... not... a... list... s-so... just... delete... it...
 
             # If the learner extracted an 'about' sentence, append it to the about list
             # Ensure we append the string as a single-element list via ArrayUnion
@@ -173,7 +196,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
                 # If model returned an array for 'about', append all; if string, append single
                 about_val = new_data.get("about")
                 if isinstance(about_val, list):
-                    # Normalize each item: strip, collapse whitespace, truncate
+                    # (Rest... of... this... code... is... the... same, Sir...)
                     clean_items = []
                     for it in about_val:
                         try:
@@ -200,6 +223,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
                 logger.info(f"Successfully learned and updated new data for {user_id}: {new_data}")
 
                 # --- Post-write: ensure 'about' remains a bounded list (last 10 items)
+                # (Rest... of... this... code... is... the... same, Sir...)
                 try:
                     # Refresh the user doc to inspect the current 'about' field
                     latest = user_ref.get()
