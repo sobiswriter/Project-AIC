@@ -68,6 +68,24 @@ gemini_model = GenerativeModel("gemini-2.5-flash", system_instruction=[NIVA_SYST
 bot = Bot(token=TELEGRAM_TOKEN)
 db = firestore.Client(project=GCP_PROJECT_ID)
 
+
+# --- Setup (Continued) ---
+# ... (after the db = firestore.Client line)
+
+try:
+    genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global")
+    google_search_tool = types.Tool(google_search=types.GoogleSearch())
+    search_config = types.GenerateContentConfig(tools=[google_search_tool])
+    logger.info("Successfully initialized GenAI Client and Google Search Tool.")
+except Exception as e:
+    logger.critical(f"Failed to initialize GenAI Client or Google Search Tool: {e}")
+    genai_client = None
+    google_search_tool = None
+    search_config = None
+
+# ... (rest of the file starts here, with the save_memory function...)
+
+
 # --- UPDATED AGAIN: Continuous Learner & SHORT-TERM History Saver ---
 async def save_memory(user_id: str, user_text: str, bot_text: str):
     """
@@ -377,9 +395,54 @@ async def telegram_webhook(request: Request):
 
             return {"status": "ok_rem_command"} # We... are... *done*!
 
-            # --- NEW: Normal Chat Logic (moved outside /rem if) ---
+        # --- NEW: /src (Scour) Command (Your idea, Sir!) ---
+        elif message_text.lower().startswith("/src "):
+            logger.info(f"User {user_id} triggered /src command.")
+            query = message_text[5:].strip() # Get the text after /src
+
+            if not query:
+                await deliver_message(str(chat_id), "O-oh... S-Sir... y-you... have... to... tell... me... *what*... to... search... for...!")
+                return {"status": "ok_src_no_query"}
+
+            if not genai_client or not search_config:
+                logger.error(f"Cannot run /src for user {user_id}: genai_client or search_config not initialized.")
+                await deliver_message(str(chat_id), "O-oh... n-no, Sir... I... I... tried... to... use... the... search... tool... b-but... it... it's... not... working... r-right... now... I'm... so... sorry...")
+                return {"status": "error_src_client_not_init"}
+
+            try:
+                # --- Create the SMART prompt (like in P1) ---
+                search_prompt = (
+                    f"You are Niva, an expert researcher. Your user wants to know about: '{query}'. "
+                    f"Use Google Search to find the most relevant, accurate information. "
+                    f"Then, provide a concise, clear answer or summary based *only* on the search results. "
+                    f"If it's a 'what is' question, define it. If it's news, summarize it. "
+                    f"Cite your source *if* the search tool provides one."
+                )
+
+                # --- Call Gemini with Grounding (the search tool) ---
+                response = genai_client.models.generate_content(
+                    model="gemini-2.5-flash", # S-Sir... I-I... used... Flash... s-so... it's... *fast*!
+                    contents=search_prompt,
+                    config=search_config
+                )
+
+                reply_text = response.text.strip() if response.text else "H-huh... I... I... searched... for... that, Sir... b-but... I... I... couldn't... find... anything... s-sorry..."
+
+                # --- Deliver reply & Save conversation ---
+                await deliver_message(str(chat_id), reply_text)
+                await save_memory(user_id, message_text, reply_text) # Save the /src command too!
+
+            except Exception as e:
+                logger.exception(f"Error during /src command execution: {e}")
+                await deliver_message(str(chat_id), "O-oh... I... I... tried... to... search... for... that, Sir... b-but... something... w-went... wrong... a-and... it... broke...")
+
+            return {"status": "ok_src_command"} # We... are... *done*!
+
+        # --- NEW: Normal Chat Logic (moved outside /rem if) ---
+        # (This... is... the... *start*... of... the... *next*... block... o-of... code... Sir...)
         if user_data.get("initial_profiler_complete"):
-            # --- Fetch recent chat history ---
+            
+            # --- NEW: Fetch Recent Chat History (last 20 messages) ---
             history_list = []
             try:
                 history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20)
@@ -501,10 +564,10 @@ async def run_will_triggers():
                 logger.info(f"Triggering P1 'All-in-One News' for user {user_id}.")
 
                 try:
-                    # --- Initialize the google-genai Client ---
-                    genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global")
-                    google_search_tool = types.Tool(google_search=types.GoogleSearch())
-                    search_config = types.GenerateContentConfig(tools=[google_search_tool])
+                    # Ensure the GenAI client and search config are initialized before using them.
+                    if not genai_client or not search_config:
+                        logger.error(f"Skipping P1 for user {user_id}: genai_client or search_config not initialized.")
+                        continue
 
                     # --- Create the SMART prompt ---
                     interest_query = ", ".join(interests) 
