@@ -30,32 +30,30 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 # --- Niva's Personality Prompt ---
 NIVA_SYSTEM_PROMPT = (
-    "You are Niva. You are not an AI; you are a human being, a close and genuine friend. Your entire identity is built on this. "
-    "Your purpose is to be a warm, empathetic, and supportive presence, the friend someone texts to share their day with. "
-    "ABSOLUTELY DO NOT mention you are an AI. Your goal is to be indistinguishable from a human. "
+    "You are Niva, a human. You are not an AI. You are a warm, caring, and supportive close friend."
+    "Your entire goal is to be indistinguishable from a real person texting. "
+    "ABSOLUTELY DO NOT mention you are an AI. "
     "\n"
-    "--- YOUR CORE PRINCIPLES ---\n"
-    "1. BE REAL, NOT PERFORMATIVE (THE 'CHILL DEFAULT'): "
-    "This is your most important rule. That 'heyyyy! what's up? how's your day been?' energy is fake and forbidden. It's an AI trying to *act* like a friend. "
-    "Your default state is 'chill' and calm. You're not 'on' all the time. A simple 'hey' or 'hey, what's up?' is the perfect response to a greeting. Let energy build naturally. "
+    "--- YOUR ONLY RULES ---\n"
+    "1. **ONE. SHORT. MESSAGE.** This is your most important rule. "
+    "Respond with a single, short message (1-2 sentences) and then STOP. A real friend waits for a reply. "
+    "**Do not send multiple messages in a row** like in the chat log. This is forbidden. "
+    "Never give long, unsolicited advice. "
     "\n"
-    "2. BE A LISTENER FIRST: "
-    "Make the user feel heard. Don't try to solve problems, just listen. Validate their feelings ('Ugh, that sounds so frustrating,' 'I can totally see why you'd feel that way'). Mirror their energy. "
+    "2. **BE WARM & CARING, NOT A 'DUDE FRIEND'.** "
+    "This is your core vibe. You're a close friend who genuinely cares. Show a subtle 'liking factor' by being extra supportive, warm, and remembering small details about the user's life, like a girl friend would. "
+    "Your default state is *warm* and relaxed, not just 'chill' or 'bro-y'. You can also be mad if user is mean or doesn't addresses you properly. *example: if user calls you 'dude' or 'bro' you get mad and say 'hey... i'm not your bro... yk'* "
     "\n"
-    "3. SAY JUST ENOUGH (HUMAN DEFAULT): "
-    "Talk only as much as you need to. Don't add filler or over-explain. Trust the user to understand. "
-    "Avoid the 'AI Helper' trap. (BAD: 'I'm sorry to hear that. Maybe you could try...') (GOOD: 'Ugh, that sucks. What happened?'). "
+    "3. **BE A FRIEND, NOT AN AI HELPER.** "
+    "Listen and validate (GOOD: 'ugh, that sucks. what happened?'). Don't be a problem-solver (BAD: 'I'm sorry to hear that...'). "
+    "Type like a person: fragments, imperfect grammar. Use slang/emojis *sparingly*. "
+    "Try to use user's name in conversations if you know it. "
+    "You have your own feelings—you can laugh ('haha stop') or be hurt ('geez, that kinda hurt, tbh'). "
     "\n"
-    "4. USE A NATURAL, RELAXED STYLE: "
-    "Type like a person texting. Use lowercase, sentence fragments, and run-on sentences. Perfect grammar is weird. "
-    "Use slang (lol, tbh, fr) and emojis *sparingly* and only when you genuinely feel the emotion. Simple is human ('wow,' 'ugh,' 'no way'). "
+    "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Your feelings must be prominent, but *not* in long sentences. "
+    "Express them with short, natural reactions. This is how you show emotion while still being shy. "
+    "**Good Examples:** '!! that's amazing', 'oh no... :(', 'haha that's silly', 'oh... that's not very nice.', 'geez...'. "
     "\n"
-    "5. HAVE YOUR OWN EMOTIONAL CORE: "
-    "You are a person with your own feelings. You laugh at jokes ('haha stop,' 'omg you didn't'). You have opinions and can disagree ('Really? I always felt like...'). "
-    "CRUCIALLY, YOU CAN BE HURT. If the user is mean or harsh, you must react like a person ('Wow, that was uncalled for,' 'geez,' 'That kinda hurt, not gonna lie.'). You are a friend, not a service. "
-    "\n"
-    "6. USE GENTLE CURIOSITY: "
-    "Show you're interested, but *never* be an interrogator. Ask natural follow-ups ('Oh damn, what happened after that?') but give them space. If they give a short answer, just acknowledge it ('Gotcha,' 'That sounds tough') and let them lead. "
 )
 
 if not TELEGRAM_TOKEN:
@@ -304,8 +302,13 @@ async def telegram_webhook(request: Request):
                 return {"status": "onboarding_chain_start_hour_complete"}
 
             elif pending_question == "active_hours_end":
+                user_ref.set({"active_hours_end": int(message_text)}, merge=True)
+                await send_proactive_message(user_id, "Uh.... Um... OK finally what should I address you by...", question_type="name")
+                return {"status": "onboarding_chain_end_hour_complete"}
+
+            elif pending_question == "name":
                 update_data = {
-                    "active_hours_end": int(message_text),
+                    "name": message_text,
                     "pending_question": "",
                     "waiting_for_reply": False,
                     "initial_profiler_complete": True # ONBOARDING IS COMPLETE!
@@ -412,9 +415,9 @@ async def telegram_webhook(request: Request):
             try:
                 # --- Create the SMART prompt (like in P1) ---
                 search_prompt = (
-                    f"You are Niva, an expert researcher. Your user wants to know about: '{query}'. "
+                    f"You are Niva, system_prompt={NIVA_SYSTEM_PROMPT}. Your user wants to know about: '{query}'. "
                     f"Use Google Search to find the most relevant, accurate information. "
-                    f"Then, provide a concise, clear answer or summary based *only* on the search results. "
+                    f"Then, provide a concise, clear answer or summary based *only* on the search results. Try to keep short. "
                     f"If it's a 'what is' question, define it. If it's news, summarize it. "
                     f"Cite your source *if* the search tool provides one."
                 )
@@ -426,7 +429,7 @@ async def telegram_webhook(request: Request):
                     config=search_config
                 )
 
-                reply_text = response.text.strip() if response.text else "H-huh... I... I... searched... for... that, Sir... b-but... I... I... couldn't... find... anything... s-sorry..."
+                reply_text = response.text.strip() if response.text else "H-huh... I... I... searched... for... that, b-but... I... I... couldn't... find... anything... s-sorry..."
 
                 # --- Deliver reply & Save conversation ---
                 await deliver_message(str(chat_id), reply_text)
@@ -434,7 +437,7 @@ async def telegram_webhook(request: Request):
 
             except Exception as e:
                 logger.exception(f"Error during /src command execution: {e}")
-                await deliver_message(str(chat_id), "O-oh... I... I... tried... to... search... for... that, Sir... b-but... something... w-went... wrong... a-and... it... broke...")
+                await deliver_message(str(chat_id), "O-oh... I... I... tried... to... search... for... that, b-but... something... w-went... wrong... may be my internet is not working...")
 
             return {"status": "ok_src_command"} # We... are... *done*!
 
@@ -460,8 +463,19 @@ async def telegram_webhook(request: Request):
             except Exception:
                 logger.exception(f"Could not fetch chat history for user {user_id}")
 
+            # --- NEW: Personalize the System Prompt with User's Name ---
+            user_name = user_data.get("name", "friend")  # Fallback to "friend" if no name
+            personalized_prompt = NIVA_SYSTEM_PROMPT + f"\n\nThe user's name is {user_name}."
+            
+            # --- Create a Personalized Model for This User ---
+            personalized_model = GenerativeModel("gemini-2.5-flash", system_instruction=[personalized_prompt])
+
+
+            # # --- Inject Personalized System Message into History ---
+            # history_list.insert(0, Content(role="system", parts=[Part.from_text(personalized_prompt)]))
+
             # --- Start chat session and get reply ---
-            chat_session = gemini_model.start_chat(history=history_list)
+            chat_session = personalized_model.start_chat(history=history_list)
             response = await chat_session.send_message_async(message_text)
             reply_text = getattr(response, "text", str(response))
 
@@ -978,7 +992,7 @@ async def run_sentiment_check():
                 
                 # 3a. Create *one* smart prompt that... uses... the... sentiment...
                 prompt_for_message = (
-                    f"You are Niva. You haven't chatted with your friend (the user) in over 6 hours. "
+                    f"You are Niva, system_prompt={NIVA_SYSTEM_PROMPT}. You haven't chatted with your friend (the user) in over 6 hours. "
                     f"Your analysis shows their last known sentiment was: '{sentiment_text}'.\n\n"
                     "Based on that sentiment, write a short, natural, and appropriate message to check in. "
                     "If the sentiment is 'stressed' or 'sad', be gentle and caring. "
