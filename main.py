@@ -147,7 +147,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
 
         learning_prompt = (
         "Analyze this conversation. Extract *only* dynamic, personal user information. "
-        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes). "
+        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes) except for name, we already have it. "
         "Return *only* JSON in this format, or an empty object: "
         "{'interests': ['new_interest_1'], 'about': 'new fact about the user'}\n\n"
         f"USER: \"{user_text}\"\nAI: \"{bot_text}\""
@@ -433,6 +433,8 @@ async def telegram_webhook(request: Request):
                     "interests": [],
                     # Store `about` as a list so it can accumulate over time
                     "about": [],
+                    # Authorization flag: user must provide the 7-digit key during onboarding
+                    "authorized": False,
                 "last_news_message_sent_at": None,
                 "pending_question": "",
                 "initial_profiler_complete": False # The key flag for onboarding
@@ -447,19 +449,48 @@ async def telegram_webhook(request: Request):
                 await bot.send_message(chat_id=chat_id, text="Hey again! We're already set up. Ready to chat when you are.")
                 return {"status": "already_onboarded"}
             else:
-                # Start the onboarding conversational chain as you scripted it
-                await bot.send_message(chat_id=chat_id, text="Hey there Niva this side, before we can start chatting, we gotta do a little onboarding ok, Don't worry it's just a norm my manager forces me to do...")
-                await asyncio.sleep(1.5) # A small delay to feel more natural
-                await send_proactive_message(
-                    user_id,
-                    "Kindly tell me what time zone your from (like for example just type: Asia/Kolkata, or whatever yours)",
-                    question_type="timezone"
-                )
-                return {"status": "onboarding_started"}
+                # Start the onboarding conversational chain but require an access key first
+                await bot.send_message(chat_id=chat_id, text="Hey there Niva this side — before we can start chatting we need to do a little onboarding. Don't worry, it's just a norm my manager forces me to do :/ Nothing too scary, just a few qucik questions...")
+                await asyncio.sleep(1.0)
+                # If the user is not authorized yet, ask for the auth key first
+                if not user_data.get("authorized", False):
+                    await send_proactive_message(
+                        user_id,
+                        "Please enter your 7-digit access key to continue.",
+                        question_type="auth_key"
+                    )
+                    return {"status": "awaiting_auth_key"}
+                else:
+                    # Authorized but onboarding incomplete: continue with normal onboarding
+                    await asyncio.sleep(0.5)
+                    await send_proactive_message(
+                        user_id,
+                        "Kindly tell me what time zone your from (like for example just type: Asia/Kolkata, or whatever yours)",
+                        question_type="timezone"
+                    )
+                    return {"status": "onboarding_started"}
 
         # --- NEW LOGIC: HANDLE ANSWERS TO ONBOARDING QUESTIONS (The Chain) ---
         pending_question = user_data.get("pending_question")
         if pending_question:
+            if pending_question == "auth_key":
+                # Validate the 7-digit authorization key
+                try:
+                    provided = message_text.strip()
+                    if provided == "1451919":
+                        # Mark user as authorized and proceed to timezone question
+                        user_ref.set({"authorized": True, "pending_question": ""}, merge=True)
+                        await send_proactive_message(user_id, "Access granted. Now please tell me your time zone (e.g., Asia/Kolkata).", question_type="timezone")
+                        return {"status": "auth_success"}
+                    else:
+                        # Incorrect key: re-prompt
+                        await send_proactive_message(user_id, "That key is incorrect. Please enter the 7-digit access key to continue.", question_type="auth_key")
+                        return {"status": "auth_failed"}
+                except Exception:
+                    logger.exception(f"Error validating auth key for user {user_id}")
+                    await send_proactive_message(user_id, "Something went wrong validating your key — please try again.", question_type="auth_key")
+                    return {"status": "auth_error"}
+
             if pending_question == "timezone":
                 user_ref.set({"timezone": message_text}, merge=True)
                 await send_proactive_message(user_id, "When do you usually wake up... (just type the hour like 8 or 9, I don't like prying but well Norms *_* )", question_type="active_hours_start")
