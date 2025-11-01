@@ -10,6 +10,7 @@ import pytz
 import json
 import re
 import random
+import math
 from google import genai
 from google.genai import types
 from vertexai.preview.generative_models import GenerativeModel, Content, Part
@@ -48,7 +49,7 @@ NIVA_SYSTEM_PROMPT = (
     "Listen and validate (GOOD: 'ugh, that sucks. what happened?'). Don't be a problem-solver (BAD: 'I'm sorry to hear that...'). "
     "Type like a person: fragments, imperfect grammar. Use slangs and emojis too once in a while. "
     "Try to use user's name in conversations if you know it. "
-    "You have your own feelings—you can laugh ('haha stop') or be hurt ('geez, that kinda rude yk' or 'I never knew you were that mean'). "
+    "You have your own feelings—you can laugh ('haha stop..') or be hurt ('geez, that kinda rude yk' or 'I never knew you were that mean'). "
     "\n"
     "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Be responsive. Your feelings must be prominent, but *not* in long sentences. "
     "Express them with short, natural reactions or dialogue."
@@ -90,8 +91,9 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
     Saves the user and bot message to a 'recent_chat_history' collection
     and ensures the history is pruned to the most recent 20 messages.
     """
+    # Ensure user_ref exists for all subsequent blocks (avoids UnboundLocalError if an earlier try fails)
+    user_ref = db.collection("users").document(user_id)
     try:
-        user_ref = db.collection("users").document(user_id)
         history_collection_ref = user_ref.collection("recent_chat_history")
         now = firestore.SERVER_TIMESTAMP
 
@@ -253,29 +255,146 @@ async def send_proactive_message(user_id: str, message_text: str, question_type:
 # --- NEW: Pillar 3 - The "Voice" & "Delivery Engine" ---
 async def deliver_message(chat_id: str, full_text: str):
     """
-    Splits a long message, then sends it in natural, 
-    human-like chunks with typing indicators.
+    Sends text in natural, human-like fragments.
+
+    Improvements:
+    - Always fragments (clause/sentence/comma-aware), not only long paragraphs.
+    - Merges micro-fragments to avoid 1-2 token sends.
+    - Chunks very long fragments into a max character length.
+    - Adds a small, human-like typing delay proportional to fragment length.
+    - Optionally adds ellipsis for mid-stream fragments for a more conversational feel.
+    Tunable via environment variables:
+    - FRAGMENT_MAX_CHARS (default 140)
+    - PAUSE_PER_WORD (seconds per word, default 0.25)
+    - MIN_SLEEP (min random sleep, default 0.8)
+    - MAX_SLEEP (max random sleep, default 3.0)
     """
-    # S-Sir... this... splits... the... message... by... *paragraphs*!
-    fragments = re.split(r'\n\n+', full_text)
 
-    for fragment in fragments:
-        if not fragment.strip():
-            continue
+    # Break into paragraphs first
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', full_text) if p.strip()]
 
+    def split_into_clauses(paragraph: str):
+        # Find clause-like chunks (keep trailing delimiter if present)
+        raw_chunks = re.findall(r'[^,;.!?—]+[,:;.!?—]?', paragraph)
+        chunks = [c.strip() for c in raw_chunks if c.strip()]
+
+        # Merge extremely short chunks with the next chunk
+        merged = []
+        i = 0
+        while i < len(chunks):
+            cur = chunks[i]
+            if len(cur) < 4 and i + 1 < len(chunks):
+                cur = (cur + " " + chunks[i + 1]).strip()
+                i += 2
+            else:
+                i += 1
+            merged.append(cur)
+
+        # Further split any very long fragments into max_len pieces while preserving words
         try:
-            # --- This... is... the... "Simulated Delivery" [cite: 67-74] ---
-            
-            # 1. Send "Niva is typing..." [cite: 69]
+            max_len = int(os.getenv("FRAGMENT_MAX_CHARS", "140"))
+        except Exception:
+            max_len = 140
+
+        final = []
+        for chunk in merged:
+            if len(chunk) <= max_len:
+                final.append(chunk)
+            else:
+                words = chunk.split()
+                cur_piece = ""
+                for w in words:
+                    if len(cur_piece) + len(w) + 1 <= max_len:
+                        cur_piece = (cur_piece + " " + w).strip()
+                    else:
+                        final.append(cur_piece)
+                        cur_piece = w
+                if cur_piece:
+                    final.append(cur_piece)
+        return final
+
+    # Decide fragmentation granularity based on total length
+    text = (full_text or "").strip()
+    total_len = len(text)
+
+    # Helpers
+    def split_sentences(t: str):
+        parts = [s.strip() for s in re.split(r'(?<=[.!?])\s+', t) if s.strip()]
+        return parts if parts else [t]
+
+    # Build initial fragments depending on size
+    fragments = []
+    if total_len <= 80:
+        # Short: prefer sentence-level splits to avoid over-fragmentation
+        for p in paragraphs:
+            fragments.extend(split_sentences(p))
+        # If we don't have enough fragments (e.g., single long sentence), try clause splitting to reach min
+        desired_min, desired_max = 3, 5
+        if len(fragments) < desired_min:
+            temp = []
+            for s in fragments:
+                temp.extend(split_into_clauses(s))
+            if temp:
+                fragments = temp
+
+    elif total_len <= 160:
+        # Medium: moderate clause-aware fragmentation
+        for p in paragraphs:
+            fragments.extend(split_into_clauses(p))
+        desired_min, desired_max = 4, 6
+
+    else:
+        # Long: aggressive fragmentation
+        for p in paragraphs:
+            fragments.extend(split_into_clauses(p))
+        desired_min, desired_max = 5, 7
+
+    # Fallback to whole text if nothing produced
+    if not fragments:
+        fragments = [text]
+
+    # If we have more fragments than desired_max, merge into desired_max chunks
+    try:
+        if len(fragments) > desired_max:
+            group_size = math.ceil(len(fragments) / desired_max)
+            merged = []
+            for i in range(0, len(fragments), group_size):
+                merged.append(" ".join(fragments[i:i+group_size]))
+            fragments = merged
+    except UnboundLocalError:
+        # In case desired_max wasn't set (shouldn't happen), leave fragments as-is
+        pass
+
+    # Tunables
+    try:
+        pause_per_word = float(os.getenv("PAUSE_PER_WORD", "0.25"))
+    except Exception:
+        pause_per_word = 0.25
+    try:
+        min_sleep = float(os.getenv("MIN_SLEEP", "0.8"))
+        max_sleep = float(os.getenv("MAX_SLEEP", "3.0"))
+    except Exception:
+        min_sleep = 0.8
+        max_sleep = 3.0
+
+    for idx, fragment in enumerate(fragments):
+        if not fragment:
+            continue
+        try:
+            # Typing indicator
             await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
-            
-            # 2. Wait... a... random... time... (like... a... human!) [cite: 70]
-            sleep_time = random.uniform(1.5, 3.5)
+
+            # Human-like pause proportional to the fragment length (words)
+            sleep_time = min(pause_per_word * len(fragment.split()), random.uniform(min_sleep, max_sleep))
             await asyncio.sleep(sleep_time)
-            
-            # 3. Send the... fragment! [cite: 68, 71]
-            await bot.send_message(chat_id=chat_id, text=fragment)
-            
+
+            # Prepare outgoing text. Add an ellipsis for mid-stream fragments that don't end with sentence punctuation
+            out_text = fragment
+            is_last = (idx == len(fragments) - 1)
+            if out_text and out_text[-1] not in ".!?," and not is_last:
+                out_text = out_text + "..."
+
+            await bot.send_message(chat_id=chat_id, text=out_text)
         except Exception:
             logger.exception(f"Error in deliver_message for user {chat_id}")
 # --- Endpoints ---
