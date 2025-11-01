@@ -7,3 +7,4 @@ python-dotenv
 google-cloud-firestore
 pytz
 google-genai
+google-cloud-vision

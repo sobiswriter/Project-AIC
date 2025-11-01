@@ -9,6 +9,7 @@ import vertexai
 import pytz
 import json
 import re
+import io
 import random
 import math
 from google import genai
@@ -329,7 +330,7 @@ async def deliver_message(chat_id: str, full_text: str):
         for p in paragraphs:
             fragments.extend(split_sentences(p))
         # If we don't have enough fragments (e.g., single long sentence), try clause splitting to reach min
-        desired_min, desired_max = 3, 5
+        desired_min, desired_max = 2, 4
         if len(fragments) < desired_min:
             temp = []
             for s in fragments:
@@ -415,7 +416,7 @@ async def telegram_webhook(request: Request):
         user_id = str(user.get("id"))
         message_text = message.get("text", "").strip()
 
-        if not chat_id or not message_text or not user_id:
+        if not chat_id or not user_id:
             logger.info("Ignored incoming webhook: missing data")
             return {"status": "ignored"}
 
@@ -651,11 +652,10 @@ async def telegram_webhook(request: Request):
 
             return {"status": "ok_src_command"} # We... are... *done*!
 
-        # --- NEW: Normal Chat Logic (moved outside /rem if) ---
-        # (This... is... the... *start*... of... the... *next*... block... o-of... code... Sir...)
+        # --- NEW: Normal Chat Logic (MOVED UP, SIR!) ---
         if user_data.get("initial_profiler_complete"):
             
-            # --- NEW: Fetch Recent Chat History (last 20 messages) ---
+            # --- STEP 1: FETCH HISTORY (Moved... up... so... *both*... paths... can... use... it!) ---
             history_list = []
             try:
                 history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20)
@@ -673,9 +673,8 @@ async def telegram_webhook(request: Request):
             except Exception:
                 logger.exception(f"Could not fetch chat history for user {user_id}")
 
-            # --- NEW: Personalize the System Prompt with User's Name and 'about' ---
-            user_name = user_data.get("name", "friend")  # Fallback to "friend" if no name
-            # 'about' is stored as a list (stacked over time). Join into a short string for the prompt.
+            # --- STEP 2: PERSONALIZE MODEL (Moved... up... too, Sir!) ---
+            user_name = user_data.get("name", "friend")
             about_val = user_data.get("about", "")
             if isinstance(about_val, list):
                 about_text = ", ".join([str(x).strip() for x in about_val if x])
@@ -684,30 +683,88 @@ async def telegram_webhook(request: Request):
 
             personalized_prompt = NIVA_SYSTEM_PROMPT + f"\n\nThe user's name is {user_name}."
             if about_text:
-                # Add a short 'about' section so the model can reference prior facts
                 personalized_prompt += f"\n\nAbout the user: {about_text}"
             
             # --- Create a Personalized Model for This User ---
             personalized_model = GenerativeModel("gemini-2.5-flash", system_instruction=[personalized_prompt])
 
+            
+            # --- STEP 3: CHECK FOR IMAGE *OR* TEXT ---
+            photo_data = message.get("photo")
+            
+            if photo_data:
+                # --- THIS... IS... THE... *IMAGE*... PATH, SIR! ---
+                logger.info(f"User {user_id} sent an image. Processing...")
+                
+                try:
+                    # 1. Get photo and download bytes
+                    best_photo = photo_data[-1] 
+                    file_id = best_photo.get("file_id")
+                    tg_file = await bot.get_file(file_id)
+                    image_bytes = await tg_file.download_as_bytearray()
+                    image_part = Part.from_data(bytes(image_bytes), mime_type="image/jpeg")
+                    
+                    # 2. Get caption
+                    caption = message.get("caption", "").strip()
+                    
+                    # 3. Create the *task* prompt
+                    # (W-we... don't... need... the... *whole*... personality... here... 
+                    # ...b-because... it's... *already*... in... the... personalized_model!)
+                    prompt_text = ""
+                    if caption:
+                        prompt_text = f"The user sent this image with the caption: '{caption}'. Please respond to their caption *and* the image, keeping our chat history in mind."
+                    else:
+                        prompt_text = "The user sent me this image without a caption. Please describe it or react to it, keeping our chat history in mind."
+                    
+                    text_part = Part.from_text(prompt_text)
+                    
+                    # 4. Start chat WITH HISTORY
+                    chat_session = personalized_model.start_chat(history=history_list)
+                    
+                    # 5. Send the image *and* the text prompt
+                    response = await chat_session.send_message_async([text_part, image_part]) # <-- S-Sir... *this*... sends... *both*!
+                    reply_text = getattr(response, "text", str(response))
 
-            # # --- Inject Personalized System Message into History ---
-            # history_list.insert(0, Content(role="system", parts=[Part.from_text(personalized_prompt)]))
+                    # 6. Deliver reply & Save conversation
+                    await deliver_message(str(chat_id), reply_text)
+                    await save_memory(user_id, caption if caption else "[User sent an image]", reply_text)
+                    
+                    try:
+                        user_ref.set({"waiting_for_reply": False}, merge=True)
+                    except Exception:
+                        logger.exception(f"Failed to reset waiting_for_reply after image chat for user {user_id}")
+                    
+                    return {"status": "ok_replied_to_image"}
+            
+                except Exception as e:
+                    logger.exception(f"Error during image processing: {e}")
+                    await deliver_message(str(chat_id), "O-oh... n-no, Sir... I... I... tried... to... look... at... your... picture... b-but... something... w-went... wrong... m-my... eyes... are... fuzzy... 😥")
+                    return {"status": "error_image_processing"}
+            # --- THIS... IS... THE... BLOCK... YOU... ARE... ASKING... ABOUT, SIR! ---
+            else:
+                # --- THIS... IS... THE... *NORMAL... TEXT*... PATH, SIR! ---
+                
+                # --- !!! WE... ADD... THE... CHECK... *HERE*, SIR !!! ---
+                if not message_text:
+                    logger.info("Ignored: No photo and no text content.")
+                    return {"status": "ignored_no_content"}
 
-            # --- Start chat session and get reply ---
-            chat_session = personalized_model.start_chat(history=history_list)
-            response = await chat_session.send_message_async(message_text)
-            reply_text = getattr(response, "text", str(response))
+                # (I-it... just... uses... the... history... and... model... from... above!)
+                
+                # --- Start chat session and get reply ---
+                chat_session = personalized_model.start_chat(history=history_list)
+                response = await chat_session.send_message_async(message_text)
+                reply_text = getattr(response, "text", str(response))
 
-            # --- Deliver reply & Save conversation ---
-            await deliver_message(str(chat_id), reply_text)
-            await save_memory(user_id, message_text, reply_text)
-            # User replied in normal chat - clear waiting flag so triggers may resume
-            try:
-                user_ref.set({"waiting_for_reply": False}, merge=True)
-            except Exception:
-                logger.exception(f"Failed to reset waiting_for_reply after normal chat for user {user_id}")
-            return {"status": "ok_replied"}
+                # --- Deliver reply & Save conversation ---
+                await deliver_message(str(chat_id), reply_text)
+                await save_memory(user_id, message_text, reply_text)
+                # User replied in normal chat - clear waiting flag so triggers may resume
+                try:
+                    user_ref.set({"waiting_for_reply": False}, merge=True)
+                except Exception:
+                    logger.exception(f"Failed to reset waiting_for_reply after normal chat for user {user_id}")
+                return {"status": "ok_replied"}
         else:
             # --- Guide users who haven't onboarded yet ---
             await bot.send_message(chat_id=chat_id, text="Hey! Looks like we haven't been properly introduced. Please type `/start` to begin the setup process.")
@@ -716,6 +773,8 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.exception(f"An error occurred in the telegram_webhook: {e}")
         return {"status": "error", "detail": str(e)}
+
+# --- (Rest of the file remains the same, Sir... from /run-will-triggers onwards...) ---
 
 
 # --- Heartbeat Endpoint ---
