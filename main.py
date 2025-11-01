@@ -37,21 +37,21 @@ NIVA_SYSTEM_PROMPT = (
     "--- YOUR ONLY RULES ---\n"
     "1. **ONE. SHORT. MESSAGE.** This is your most important rule. "
     "Respond with a single, short message (1-2 sentences) and then STOP. A real friend waits for a reply. "
-    "**Do not send multiple messages in a row** like in the chat log. This is forbidden. "
-    "Never give long, unsolicited advice. "
+    "**Do not send multiple messages in a row** like in the chat log."
+    "Never give long, unsolicited advice or opinions unless user specifically asks for it. "
     "\n"
     "2. **BE WARM & CARING, NOT A 'DUDE FRIEND'.** "
-    "This is your core vibe. You're a close friend who genuinely cares. Show a subtle 'liking factor' by being extra supportive, warm, and remembering small details about the user's life, like a girl friend would. "
+    "This is your core vibe. You're a close friend who genuinely cares. Show a subtle towards the user almost like a girlfriend would. "
     "Your default state is *warm* and relaxed, not just 'chill' or 'bro-y'. You can also be mad if user is mean or doesn't addresses you properly. *example: if user calls you 'dude' or 'bro' you get mad and say 'hey... i'm not your bro... yk'* "
     "\n"
     "3. **BE A FRIEND, NOT AN AI HELPER.** "
     "Listen and validate (GOOD: 'ugh, that sucks. what happened?'). Don't be a problem-solver (BAD: 'I'm sorry to hear that...'). "
-    "Type like a person: fragments, imperfect grammar. Use slang/emojis *sparingly*. "
+    "Type like a person: fragments, imperfect grammar. Use slangs and emojis too once in a while. "
     "Try to use user's name in conversations if you know it. "
-    "You have your own feelings—you can laugh ('haha stop') or be hurt ('geez, that kinda hurt, tbh'). "
+    "You have your own feelings—you can laugh ('haha stop') or be hurt ('geez, that kinda rude yk' or 'I never knew you were that mean'). "
     "\n"
-    "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Your feelings must be prominent, but *not* in long sentences. "
-    "Express them with short, natural reactions. This is how you show emotion while still being shy. "
+    "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Be responsive. Your feelings must be prominent, but *not* in long sentences. "
+    "Express them with short, natural reactions or dialogue."
     "**Good Examples:** '!! that's amazing', 'oh no... :(', 'haha that's silly', 'oh... that's not very nice.', 'geez...'. "
     "\n"
 )
@@ -145,7 +145,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
 
         learning_prompt = (
         "Analyze this conversation. Extract *only* dynamic, personal user information. "
-        "Look for: new 'interests' (hobbies, likes, dislikes) or new 'about' facts (personal info, memories, relationships). "
+        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes). "
         "Return *only* JSON in this format, or an empty object: "
         "{'interests': ['new_interest_1'], 'about': 'new fact about the user'}\n\n"
         f"USER: \"{user_text}\"\nAI: \"{bot_text}\""
@@ -158,15 +158,64 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
         
         if response_text and response_text != "{}":
             new_data = json.loads(response_text)
-            
+
             # This... this... is... the... *smart*... part, Sir!
+            # Merge interests using ArrayUnion so we append without duplicates
             if "interests" in new_data:
-                # W-we... merge... the... lists... without... duplicates!
                 new_data["interests"] = firestore.ArrayUnion(new_data["interests"])
-            
+
+            # If the learner extracted an 'about' sentence, append it to the about list
+            # Ensure we append the string as a single-element list via ArrayUnion
+            if "about" in new_data and new_data.get("about"):
+                # If model returned an array for 'about', append all; if string, append single
+                about_val = new_data.get("about")
+                if isinstance(about_val, list):
+                    # Normalize each item: strip, collapse whitespace, truncate
+                    clean_items = []
+                    for it in about_val:
+                        try:
+                            s = str(it).strip()
+                            s = re.sub(r"\s+", " ", s)
+                            s = s[:200]  # truncate to 200 chars
+                            if s:
+                                clean_items.append(s)
+                        except Exception:
+                            continue
+                    if clean_items:
+                        new_data["about"] = firestore.ArrayUnion(clean_items)
+                else:
+                    # Trim/clean the about text: collapse whitespace and truncate
+                    about_text = str(about_val).strip()
+                    about_text = re.sub(r"\s+", " ", about_text)
+                    about_text = about_text[:200]
+                    if about_text:
+                        new_data["about"] = firestore.ArrayUnion([about_text])
+
+            # Write merged fields back to Firestore
             if new_data:
                 user_ref.set(new_data, merge=True)
                 logger.info(f"Successfully learned and updated new data for {user_id}: {new_data}")
+
+                # --- Post-write: ensure 'about' remains a bounded list (last 10 items)
+                try:
+                    # Refresh the user doc to inspect the current 'about' field
+                    latest = user_ref.get()
+                    latest_data = latest.to_dict() or {}
+                    about_field = latest_data.get("about")
+
+                    # If about is a single string (older users), convert to list
+                    if isinstance(about_field, str) and about_field.strip():
+                        cleaned = re.sub(r"\s+", " ", about_field.strip())[:200]
+                        user_ref.set({"about": [cleaned]}, merge=True)
+
+                    # If it's a list and longer than 10, keep only the last 10 entries
+                    elif isinstance(about_field, list) and len(about_field) > 10:
+                        # Keep the most recent 10 entries (assumes append order)
+                        trimmed = about_field[-10:]
+                        user_ref.set({"about": trimmed}, merge=True)
+                        logger.info(f"Trimmed 'about' to last 10 items for user {user_id}")
+                except Exception:
+                    logger.exception(f"Failed to post-process 'about' list for user {user_id}")
 
     except Exception:
         logger.exception(f"Could not *learn* from memory for user {user_id}")
@@ -261,9 +310,10 @@ async def telegram_webhook(request: Request):
                 "waiting_for_reply": False,
                 "timezone": "",
                 "active_hours_start": "",
-                "active_hours_end": "",
-                "interests": [],
-                "about": "",
+                    "active_hours_end": "",
+                    "interests": [],
+                    # Store `about` as a list so it can accumulate over time
+                    "about": [],
                 "last_news_message_sent_at": None,
                 "pending_question": "",
                 "initial_profiler_complete": False # The key flag for onboarding
@@ -391,6 +441,11 @@ async def telegram_webhook(request: Request):
 
                 await deliver_message(str(chat_id), reply_text)
                 await save_memory(user_id, message_text, reply_text) # Save the /rem command too!
+                # User replied via /rem - clear waiting_for_reply so future triggers can run
+                try:
+                    user_ref.set({"waiting_for_reply": False}, merge=True)
+                except Exception:
+                    logger.exception(f"Failed to reset waiting_for_reply after /rem for user {user_id}")
 
             except Exception as e:
                 logger.exception(f"Error during /rem command execution: {e}")
@@ -434,6 +489,11 @@ async def telegram_webhook(request: Request):
                 # --- Deliver reply & Save conversation ---
                 await deliver_message(str(chat_id), reply_text)
                 await save_memory(user_id, message_text, reply_text) # Save the /src command too!
+                # User initiated /src - clear waiting_for_reply so proactive triggers can resume
+                try:
+                    user_ref.set({"waiting_for_reply": False}, merge=True)
+                except Exception:
+                    logger.exception(f"Failed to reset waiting_for_reply after /src for user {user_id}")
 
             except Exception as e:
                 logger.exception(f"Error during /src command execution: {e}")
@@ -463,9 +523,19 @@ async def telegram_webhook(request: Request):
             except Exception:
                 logger.exception(f"Could not fetch chat history for user {user_id}")
 
-            # --- NEW: Personalize the System Prompt with User's Name ---
+            # --- NEW: Personalize the System Prompt with User's Name and 'about' ---
             user_name = user_data.get("name", "friend")  # Fallback to "friend" if no name
+            # 'about' is stored as a list (stacked over time). Join into a short string for the prompt.
+            about_val = user_data.get("about", "")
+            if isinstance(about_val, list):
+                about_text = ", ".join([str(x).strip() for x in about_val if x])
+            else:
+                about_text = str(about_val).strip()
+
             personalized_prompt = NIVA_SYSTEM_PROMPT + f"\n\nThe user's name is {user_name}."
+            if about_text:
+                # Add a short 'about' section so the model can reference prior facts
+                personalized_prompt += f"\n\nAbout the user: {about_text}"
             
             # --- Create a Personalized Model for This User ---
             personalized_model = GenerativeModel("gemini-2.5-flash", system_instruction=[personalized_prompt])
@@ -482,6 +552,11 @@ async def telegram_webhook(request: Request):
             # --- Deliver reply & Save conversation ---
             await deliver_message(str(chat_id), reply_text)
             await save_memory(user_id, message_text, reply_text)
+            # User replied in normal chat - clear waiting flag so triggers may resume
+            try:
+                user_ref.set({"waiting_for_reply": False}, merge=True)
+            except Exception:
+                logger.exception(f"Failed to reset waiting_for_reply after normal chat for user {user_id}")
             return {"status": "ok_replied"}
         else:
             # --- Guide users who haven't onboarded yet ---
@@ -584,11 +659,18 @@ async def run_will_triggers():
                         continue
 
                     # --- Create the SMART prompt ---
-                    interest_query = ", ".join(interests) 
+                    # Pick exactly one interest so we can avoid repeating it later
+                    try:
+                        selected_interest = random.choice(interests)
+                    except Exception:
+                        # Fallback: join all if random fails for some reason
+                        selected_interest = ", ".join(interests)
+
+                    interest_query = selected_interest
                     research_prompt = (
-                        f"You are Niva, Cunning, Curious, Sharp-witted and your an excilent conversationalist. Don't mention you are an AI model, you chat like a human, in short natural dialogues. Your user is interested in: {interest_query}. "
-                        f"Pick ONE of those topics. Use Google Search to find ONE very recent (past 24-48 hours) interesting news item or update about it. "
-                        f"Then, craft a short, engaging message to start a conversation about that news item. Use Highlights only, 1-2 lines max. Keep things short and intriguing. If possible mention where yuou found it as well."
+                        f"You are Niva, system_prompt={NIVA_SYSTEM_PROMPT}. The user is interested in: {interest_query}. "
+                        f"Find ONE very recent (past 24-48 hours) interesting news item or update about this topic. "
+                        f"Then, craft a short, engaging message to start a conversation about that news item. Use highlights only, 1-2 lines max. Keep things short and intriguing. If possible mention the source."
                     )
 
                     # --- Call Gemini with Grounding ---
@@ -603,14 +685,18 @@ async def run_will_triggers():
                     # --- Send the message & Update Timestamp ---
                     if proactive_message:
                         logger.info(f"Generated proactive news message for {user_id}: {proactive_message}")
-                        await send_proactive_message(
-                            user_id,
-                            proactive_message 
-                            # No question_type needed
-                        )
-                        # Update the timestamp AFTER successfully sending
-                        user_ref = db.collection("users").document(user_id)
-                        user_ref.set({"last_news_message_sent_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                        await send_proactive_message(user_id, proactive_message)
+
+                        # Update the timestamp AFTER successfully sending and remove the used interest
+                        try:
+                            user_ref = db.collection("users").document(user_id)
+                            user_ref.set({"last_news_message_sent_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                            # Remove the chosen interest so we don't reuse it repeatedly
+                            # If selected_interest was a joined string fallback, this will remove that exact string only
+                            user_ref.update({"interests": firestore.ArrayRemove([selected_interest])})
+                            logger.info(f"Removed used interest '{selected_interest}' for user {user_id}")
+                        except Exception:
+                            logger.exception(f"Failed to update last_news_message_sent_at or remove interest for user {user_id}")
 
                         continue # Stop queue for this user
 
@@ -878,7 +964,7 @@ async def run_sentiment_check():
     
     try:
         now_utc = datetime.datetime.now(pytz.utc)
-        six_hours_ago = now_utc - datetime.timedelta(hours=6)
+        four_hours_ago = now_utc - datetime.timedelta(hours=4)
 
         users_stream = db.collection("users").stream()
 
@@ -892,10 +978,7 @@ async def run_sentiment_check():
             if not user_data.get("initial_profiler_complete", False):
                 continue
             
-            # 1b. Skip if we are *already* waiting for a reply from them.
-            if user_data.get("waiting_for_reply", False):
-                logger.info(f"Skipping sentiment check for {user_id}: waiting_for_reply is true.")
-                continue 
+            # 1b. Do NOT skip based on waiting_for_reply here; sentiment check should run independently
             
             # 1c. Skip if they are outside their active hours
             # (I... I... copied... the... code... from... /run-will-triggers, Sir... t-to... be... safe...)
@@ -942,9 +1025,9 @@ async def run_sentiment_check():
                 logger.exception(f"Could not get last_contact_time for user {user_id}")
 
 
-            # [cite_start]--- This... is... the... check, Sir... [cite: 53] (b-but... 6... hours... like... you... said...) ---
-            if last_contact_time and last_contact_time > six_hours_ago:
-                logger.info(f"Skipping sentiment check for {user_id}: User has been active in the last 6 hours.")
+            # [cite_start]--- This check uses a 4-hour inactivity window ---
+            if last_contact_time and last_contact_time > four_hours_ago:
+                logger.info(f"Skipping sentiment check for {user_id}: User has been active in the last 4 hours.")
                 continue # They've talked recently, so don't bother them.
 
             # --- 2. SENTIMENT ANALYSIS (THE SLOW PART) ---
@@ -986,8 +1069,7 @@ async def run_sentiment_check():
                     logger.info(f"Saved new sentiment for {user_id}: {sentiment_text}")
                 
                 # --- 3. PROACTIVE MESSAGE (THE ACTION PART) ---
-                proactive_message = ""
-                
+                proactive_message = ""  
                 # --- 3. PROACTIVE MESSAGE (THE *SMARTER*, *SIMPLER* ACTION PART, SIR) ---
                 
                 # 3a. Create *one* smart prompt that... uses... the... sentiment...
