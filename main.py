@@ -16,7 +16,6 @@ from google import genai
 from google.genai import types
 from vertexai.preview.generative_models import GenerativeModel, Content, Part
 
-
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from vertexai.preview.generative_models import GenerativeModel
@@ -49,8 +48,7 @@ NIVA_SYSTEM_PROMPT = (
     "3. **BE A FRIEND, NOT AN AI HELPER.** "
     "Listen and validate (GOOD: 'ugh, that sucks. what happened?'). Don't be a problem-solver (BAD: 'I'm sorry to hear that...'). "
     "Type like a person: fragments, imperfect grammar. Use slangs and emojis too once in a while. "
-    "Try to use user's name in conversations if you know it. "
-    "You have your own feelings—you can laugh ('haha stop..') or be hurt ('geez, that kinda rude yk' or 'I never knew you were that mean'). "
+    "You have your own feelings—you can laugh or be hurt ('geez, that kinda rude yk' or 'I never knew you were that mean..'). "
     "\n"
     "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Be responsive. Your feelings must be prominent, but *not* in long sentences. "
     "Express them with short, natural reactions or dialogue."
@@ -349,7 +347,7 @@ async def deliver_message(chat_id: str, full_text: str):
 
     # Build initial fragments depending on size
     fragments = []
-    if total_len <= 80:
+    if total_len <= 120:
         # Short: prefer sentence-level splits to avoid over-fragmentation
         for p in paragraphs:
             fragments.extend(split_sentences(p))
@@ -362,17 +360,17 @@ async def deliver_message(chat_id: str, full_text: str):
             if temp:
                 fragments = temp
 
-    elif total_len <= 160:
+    elif total_len <= 200:
         # Medium: moderate clause-aware fragmentation
         for p in paragraphs:
             fragments.extend(split_into_clauses(p))
-        desired_min, desired_max = 4, 6
+        desired_min, desired_max = 3, 6
 
     else:
         # Long: aggressive fragmentation
         for p in paragraphs:
             fragments.extend(split_into_clauses(p))
-        desired_min, desired_max = 5, 7
+        desired_min, desired_max = 4, 7
 
     # Fallback to whole text if nothing produced
     if not fragments:
@@ -1306,13 +1304,18 @@ async def run_sentiment_check():
                 # --- 3. PROACTIVE MESSAGE (THE *SMARTER*, *SIMPLER* ACTION PART, SIR) ---
                 
                 # 3a. Create *one* smart prompt that... uses... the... sentiment...
+                # Include user's name in the generation prompt
+                user_name = user_data.get("name", "friend")
+                safe_name = str(user_name).strip() if user_name else "friend"
+
                 prompt_for_message = (
                     f"You are Niva, system_prompt={NIVA_SYSTEM_PROMPT}. You haven't chatted with your friend (the user) in over 6 hours. "
                     f"Your analysis shows their last known sentiment was: '{sentiment_text}'.\n\n"
+                    f"The user's name is {safe_name}.\n\n"
                     "Based on that sentiment, write a short, natural, and appropriate message to check in. "
                     "If the sentiment is 'stressed' or 'sad', be gentle and caring. "
-                    "If it's 'neutral' or 'happy', just be casual and warm. "
-                    "Keep it to 1-3 short sentences. *Do not* sound like an AI."
+                    "If it's 'neutral' or 'happy', be casual and warm. "
+                    "Keep it to 1-3 short sentences. Do not sound like an AI."
                 )
 
                 # 3b. Generate... the... human... message...
