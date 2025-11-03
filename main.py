@@ -48,7 +48,7 @@ NIVA_SYSTEM_PROMPT = (
     "3. **ACT LIKE A REAL FRIEND.** "
     "Emotion runs through you quietly: if something's sweet, you smile in text; if it stings, you shrink a little; "
     "if it's funny, you actually laugh — not 'haha', but whatever slips out naturally."
-    "Type like a person: fragments, imperfect grammar, slangs. Very rarely use emojis and never in consecutive messages."
+    "Type like a person: fragments, imperfect grammar, slangs. Do not use emojis."
     "You have your own emotions, you can laugh, tease, pout or be hurt (*example* 'geez, that kinda rude yk' or 'I never knew you were that mean..'). "
     "\n"
     "4. **SHOW FEELINGS (BUT KEEP IT SHORT).** Be responsive. Your feelings must be prominent, but *not* in long sentences. "
@@ -1304,25 +1304,64 @@ async def run_sentiment_check():
                 proactive_message = ""  
                 # --- 3. PROACTIVE MESSAGE (THE *SMARTER*, *SIMPLER* ACTION PART, SIR) ---
                 
-                # 3a. Create *one* smart prompt that... uses... the... sentiment...
-                # Include user's name in the generation prompt
-                user_name = user_data.get("name", "friend")
-                safe_name = str(user_name).strip() if user_name else "friend"
+                # 3a. Resolve the user's name reliably and create a concise prompt.
+                def _resolve_safe_name(doc_data, doc_ref):
+                    # Try common fields first
+                    for key in ("name", "first_name", "display_name", "given_name", "nickname", "username"):
+                        val = doc_data.get(key) if isinstance(doc_data, dict) else None
+                        if val:
+                            candidate = str(val)
+                            break
+                    else:
+                        candidate = None
 
+                    # If not found in snapshot, try reading the live document
+                    if not candidate:
+                        try:
+                            fresh = doc_ref.get().to_dict() or {}
+                            for key in ("name", "first_name", "display_name", "given_name", "nickname", "username"):
+                                val = fresh.get(key)
+                                if val:
+                                    candidate = str(val)
+                                    break
+                        except Exception:
+                            candidate = None
+
+                    name = (candidate or "").strip()
+                    # Keep letters (including basic latin accents), spaces, apostrophes and hyphens
+                    name = re.sub(r"[^A-Za-z\u00C0-\u017F '\\-]", "", name)
+                    name = re.sub(r"\s+", " ", name).strip()
+
+                    if not name:
+                        return "friend"
+
+                    # Prefer the first token (first name). Remove leading @ and underscores if present.
+                    first_token = name.split()[0]
+                    first_token = first_token.lstrip("@").replace("_", " ").split()[0]
+                    # Capitalize nicely
+                    return first_token.capitalize()
+
+                safe_name = _resolve_safe_name(user_data, user_ref)
+                logger.debug(f"Resolved safe_name for user {user_id}: '{safe_name}'")
+
+                # Short, strict prompt: must begin with the exact name followed by a comma and be a warm personal check-in.
                 prompt_for_message = (
-                    f"You are Niva, system_prompt={NIVA_SYSTEM_PROMPT}. You haven't chatted with your friend (the user) in over 6 hours. "
-                    f"Your analysis shows their last known sentiment was: '{sentiment_text}'.\n\n"
-                    f"The user's name is {safe_name}.\n\n"
-                    "Based on that sentiment, write a short, natural, and appropriate message to check in. "
-                    "If the sentiment is 'stressed' or 'sad', be gentle and caring. "
-                    "If it's 'neutral' or 'happy', be casual and warm. "
-                    "Keep it to 1-3 short sentences. Do not sound like an AI."
+                    f"Begin the message with exactly '{safe_name},' then write a warm, personal check-in based on the sentiment '{sentiment_text}'. "
+                    "Keep it 1-3 short sentences. If sentiment is 'stressed' or 'sad' be gentle and caring; otherwise be casual and warm. "
+                    "Do not mention you are an AI."
                 )
 
                 # 3b. Generate... the... human... message...
                 try:
                     generation_response = await gemini_model.generate_content_async(prompt_for_message)
                     proactive_message = generation_response.text.strip()
+
+                    # Safety: ensure message starts with the name. If the model omitted it, prefix it.
+                    if proactive_message:
+                        # Normalize whitespace
+                        proactive_message = re.sub(r"\s+", " ", proactive_message).strip()
+                        if not proactive_message.lower().startswith(safe_name.lower() + ","):
+                            proactive_message = f"{safe_name}, {proactive_message}"
                 except Exception as gen_e:
                     logger.exception(f"Could not *generate* proactive message for {user_id}: {gen_e}")
                     proactive_message = "" # F-fail... safe, Sir...
