@@ -1307,7 +1307,7 @@ async def run_sentiment_check():
                 # 3a. Resolve the user's name reliably and create a concise prompt.
                 def _resolve_safe_name(doc_data, doc_ref):
                     # Try common fields first
-                    for key in ("name", "first_name", "display_name", "given_name", "nickname", "username"):
+                    for key in ("name"):
                         val = doc_data.get(key) if isinstance(doc_data, dict) else None
                         if val:
                             candidate = str(val)
@@ -1319,7 +1319,7 @@ async def run_sentiment_check():
                     if not candidate:
                         try:
                             fresh = doc_ref.get().to_dict() or {}
-                            for key in ("name", "first_name", "display_name", "given_name", "nickname", "username"):
+                            for key in ("name"):
                                 val = fresh.get(key)
                                 if val:
                                     candidate = str(val)
@@ -1333,7 +1333,7 @@ async def run_sentiment_check():
                     name = re.sub(r"\s+", " ", name).strip()
 
                     if not name:
-                        return "friend"
+                        return "Sobi"  # Fallback name
 
                     # Prefer the first token (first name). Remove leading @ and underscores if present.
                     first_token = name.split()[0]
@@ -1387,5 +1387,180 @@ async def run_sentiment_check():
 
 
 # --- Run Server ---
+@app.post("/run-followups")
+async def run_followups():
+    """
+    Send occasional follow-ups ~10 minutes after the bot's last message if the user hasn't replied.
+    Tunables via env:
+      FOLLOWUP_PROB (0.0-1.0, default 0.35)
+      FOLLOWUP_WINDOW_MINUTES (center, default 10)
+      FOLLOWUP_WINDOW_TOLERANCE (seconds tolerance, default 120)
+      FOLLOWUP_HISTORY_MESSAGES (how many recent messages to include, default 6)
+    """
+    logger.info("Followups job fired: checking for potential followups...")
+    try:
+        now_utc = datetime.datetime.now(pytz.utc)
+        prob = float(os.getenv("FOLLOWUP_PROB", "0.35"))
+        center_minutes = int(os.getenv("FOLLOWUP_WINDOW_MINUTES", "10"))
+        tol_seconds = int(os.getenv("FOLLOWUP_WINDOW_TOLERANCE", "120"))
+        history_msgs = int(os.getenv("FOLLOWUP_HISTORY_MESSAGES", "6"))
+
+        users_stream = db.collection("users").stream()
+        for user_doc in users_stream:
+            user_id = user_doc.id
+            user_ref = user_doc.reference
+            user_data = user_doc.to_dict() or {}
+
+            # Basic qualification
+            if not user_data.get("initial_profiler_complete", False):
+                continue
+
+            # Respect active hours
+            tz_str = user_data.get("timezone")
+            sh = user_data.get("active_hours_start")
+            eh = user_data.get("active_hours_end")
+            if not (tz_str and sh is not None and eh is not None):
+                continue
+            try:
+                user_tz = pytz.timezone(tz_str)
+                current_hour = datetime.datetime.now(user_tz).hour
+                s_h = int(sh); e_h = int(eh)
+                if s_h < e_h:
+                    if not (s_h <= current_hour < e_h):
+                        continue
+                else:
+                    if not (current_hour >= s_h or current_hour < e_h):
+                        continue
+            except Exception:
+                continue
+
+            # Avoid repeated followups: skip if recently followed up (e.g., within 1 hour)
+            last_followup = user_data.get("last_followup_sent_at")
+            if last_followup:
+                try:
+                    if last_followup.tzinfo is None:
+                        last_followup = last_followup.replace(tzinfo=pytz.utc)
+                    if (now_utc - last_followup).total_seconds() < 3600:
+                        continue
+                except Exception:
+                    pass
+
+            # Get the last N messages
+            try:
+                hist_q = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(history_msgs)
+                docs = list(hist_q.stream())
+                if not docs:
+                    continue
+
+                # The most recent message (first in docs) must be from the model and roughly center_minutes old
+                last_doc = docs[0].to_dict()
+                last_role = (last_doc.get("role") or "").lower()
+                last_ts = last_doc.get("timestamp")
+                if not last_ts:
+                    continue
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=pytz.utc)
+                delta = (now_utc - last_ts).total_seconds()
+                center = center_minutes * 60
+                # Only consider followup if the last message was from the model and is ~center_minutes old (within tolerance)
+                if last_role != "model":
+                    continue
+                if not (center - tol_seconds <= delta <= center + tol_seconds):
+                    continue
+
+                # Ensure the user hasn't replied since (i.e., second-most recent message is not a user reply after that model message)
+                # Since docs are descending, check if any doc after index 0 has role 'user' and a timestamp > last_ts
+                user_replied_after = False
+                for d in docs[1:]:
+                    ddata = d.to_dict()
+                    role = (ddata.get("role") or "").lower()
+                    if role == "user":
+                        # The user replied more recently than the model message if their timestamp is >= last_ts
+                        ts = ddata.get("timestamp")
+                        if ts and ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=pytz.utc)
+                        if ts and ts >= last_ts:
+                            user_replied_after = True
+                            break
+                if user_replied_after:
+                    continue
+
+                # Random chance
+                if random.random() > prob:
+                    continue
+
+                # Build a short history blob (chronological order)
+                history_entries = []
+                for d in reversed(docs):
+                    ddata = d.to_dict()
+                    role = ddata.get("role")
+                    text = ddata.get("text")
+                    if role and text:
+                        history_entries.append(f"{role.upper()}: {text}")
+                history_blob = "\n".join(history_entries[-6:]) if history_entries else ""
+
+                # Resolve a safe name (context only; do not require starting with it)
+                def _resolve_safe_name(doc_data, doc_ref):
+                    for key in ("name"):
+                        val = doc_data.get(key) if isinstance(doc_data, dict) else None
+                        if val:
+                            candidate = str(val)
+                            break
+                    else:
+                        candidate = None
+                    if not candidate:
+                        try:
+                            fresh = doc_ref.get().to_dict() or {}
+                            for key in ("name"):
+                                val = fresh.get(key)
+                                if val:
+                                    candidate = str(val)
+                                    break
+                        except Exception:
+                            candidate = None
+                    name = (candidate or "").strip()
+                    name = re.sub(r"[^A-Za-z\u00C0-\u017F '\\-]", "", name)
+                    name = re.sub(r"\s+", " ", name).strip()
+                    if not name:
+                        return "Sobi"
+                    first_token = name.split()[0]
+                    first_token = first_token.lstrip("@").replace("_", " ").split()[0]
+                    return first_token.capitalize()
+
+                safe_name = _resolve_safe_name(user_data, user_ref)
+
+                # Short follow-up prompt using recent history
+                followup_prompt = (
+                    "You are Niva. Below is the recent chat between you and the user. "
+                    f"The user's name is {safe_name}.\n\n"
+                    "Recent chat:\n"
+                    f"{history_blob}\n\n"
+                    "Write a short, friendly follow-up (1-2 short sentences) to re-engage the user based on the recent messages or you can even start a new conversation. "
+                    "Do not mention you are an AI. Keep the tone natural and human."
+                )
+
+                try:
+                    resp = await gemini_model.generate_content_async(followup_prompt)
+                    followup_text = (getattr(resp, 'text', '') or '').strip()
+                    if followup_text:
+                        followup_text = re.sub(r"\s+", " ", followup_text).strip()
+                        # Send followup
+                        await send_proactive_message(user_id, followup_text)
+                        try:
+                            user_ref.set({"last_followup_sent_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                        except Exception:
+                            logger.exception(f"Failed to set last_followup_sent_at for {user_id}")
+                except Exception:
+                    logger.exception(f"Failed to generate/send followup for user {user_id}")
+
+            except Exception:
+                logger.exception(f"Could not evaluate followup timing for user {user_id}")
+                continue
+
+    except Exception:
+        logger.exception("Error during /run-followups")
+
+    return {"status": "followups_triggered"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
