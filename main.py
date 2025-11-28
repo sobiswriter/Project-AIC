@@ -1213,7 +1213,6 @@ async def run_sentiment_check():
             # 1b. Do NOT skip based on waiting_for_reply here; sentiment check should run independently
             
             # 1c. Skip if they are outside their active hours
-            # (I... I... copied... the... code... from... /run-will-triggers, Sir... t-to... be... safe...)
             user_tz_str = user_data.get("timezone")
             start_hour_val = user_data.get("active_hours_start")
             end_hour_val = user_data.get("active_hours_end")
@@ -1346,9 +1345,9 @@ async def run_sentiment_check():
 
                 # Short, strict prompt: must begin with the exact name followed by a comma and be a warm personal check-in.
                 prompt_for_message = (
-                    f"Begin the message with exactly '{safe_name},' then write a warm, personal check-in based on the sentiment '{sentiment_text}'. "
-                    "Keep it 1-3 short sentences. If sentiment is 'stressed' or 'sad' be gentle and caring; otherwise be casual and warm. "
-                    "Do not mention you are an AI."
+                    f"The user's name is '{safe_name},' the user's sentiment is '{sentiment_text}'. Your task is to write a warm, wise, personal check-in. "
+                    "Keep it within 1-2 short sentences. Be wise about it, do not use words like 'Stranger' or 'Friend' to address the user, it should feel personal. Use the user's name if it is there but if it's not there, it's not a necessity to use it, an example message could be if the user's sentiment is 'stressed': 'Hey it's been a while, are you doing alright? Just wanted to say hi since you've been qutiet lately.' "
+                    "Rest you be wise and write messages accordingly. Do not mention you are an AI."
                 )
 
                 # 3b. Generate... the... human... message...
@@ -1400,7 +1399,7 @@ async def run_followups():
     logger.info("Followups job fired: checking for potential followups...")
     try:
         now_utc = datetime.datetime.now(pytz.utc)
-        prob = float(os.getenv("FOLLOWUP_PROB", "0.35"))
+        prob = float(os.getenv("FOLLOWUP_PROB", "0.5"))
         center_minutes = int(os.getenv("FOLLOWUP_WINDOW_MINUTES", "10"))
         tol_seconds = int(os.getenv("FOLLOWUP_WINDOW_TOLERANCE", "120"))
         history_msgs = int(os.getenv("FOLLOWUP_HISTORY_MESSAGES", "6"))
@@ -1462,10 +1461,15 @@ async def run_followups():
                     last_ts = last_ts.replace(tzinfo=pytz.utc)
                 delta = (now_utc - last_ts).total_seconds()
                 center = center_minutes * 60
-                # Only consider followup if the last message was from the model and is ~center_minutes old (within tolerance)
+                # Only consider followup if the last message was from the model and is
+                # strictly LESS THAN the center (i.e., within the configured window).
+                # This prevents sending followups exactly at or after the center time.
                 if last_role != "model":
                     continue
-                if not (center - tol_seconds <= delta <= center + tol_seconds):
+                # Require the model message to be more recent than 0 seconds and
+                # strictly less than the center (e.g., 10 minutes) — i.e., within the
+                # desired time window, not at/after the center minute.
+                if not (0 < delta < center):
                     continue
 
                 # Ensure the user hasn't replied since (i.e., second-most recent message is not a user reply after that model message)
