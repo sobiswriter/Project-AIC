@@ -74,7 +74,7 @@ embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-005")
 async def save_memory(user_id: str, user_text: str, bot_text: str):
     """
     Saves the user and bot message to a 'recent_chat_history' collection
-    and ensures the history is pruned to the most recent 20 messages.
+    and ensures the history is pruned to the most recent 30 messages.
     """
     try:
         user_ref = db.collection("users").document(user_id)
@@ -101,9 +101,9 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
         all_messages_query = history_collection_ref.order_by("timestamp", direction=firestore.Query.DESCENDING)
         docs = list(all_messages_query.stream()) # Get all docs
 
-        # If we have more than 20 messages, delete the oldest ones
-        if len(docs) > 20:
-            messages_to_delete = docs[20:] # Get all messages after the 20th
+        # If we have more than 30 messages, delete the oldest ones
+        if len(docs) > 30:
+            messages_to_delete = docs[30:] # Get all messages after the 30th
             for doc in messages_to_delete:
                 doc.reference.delete()
             logger.info(f"Pruned {len(messages_to_delete)} old messages from history for {user_id}")
@@ -305,7 +305,7 @@ async def telegram_webhook(request: Request):
             # --- Fetch recent chat history ---
             history_list = []
             try:
-                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20)
+                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(30)
                 docs = history_query.stream()
                 temp_history = []
                 for doc in docs:

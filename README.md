@@ -104,7 +104,7 @@ Note: If you run locally for development, create a `.env` file with at least `TE
 ## Configuration & Tunables (exposed in `main.py`)
 
 - Onboarding auth key in source: `1451919` (currently hard-coded; change for production)
-- Memory pruning: `recent_chat_history` is pruned to 20 entries per user in `save_memory()`
+- Memory pruning: `recent_chat_history` is pruned to 40 entries per user in `save_memory()`
 - Journal rollups: daily -> weekly -> monthly endpoints run summarization and delete source docs as implemented
 - Sentiment/Proactive timings are controlled by time-based endpoints (`/run-sentiment-check`, `/run-followups`, `/run-will-triggers`)
 
