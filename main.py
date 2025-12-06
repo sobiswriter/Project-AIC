@@ -88,7 +88,7 @@ except Exception as e:
 async def save_memory(user_id: str, user_text: str, bot_text: str):
     """
     Saves the user and bot message to a 'recent_chat_history' collection
-    and ensures the history is pruned to the most recent 40 messages.
+    and ensures the history is pruned to the most recent 25 messages.
     """
     # Ensure user_ref exists for all subsequent blocks (avoids UnboundLocalError if an earlier try fails)
     user_ref = db.collection("users").document(user_id)
@@ -111,14 +111,14 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
         })
         logger.info(f"Saved chat turn to recent_chat_history for {user_id}")
 
-        # --- Pruning Logic: Keep only the most recent 40 messages ---
+        # --- Pruning Logic: Keep only the most recent 25 messages ---
         # Query for all documents, ordered by timestamp
         all_messages_query = history_collection_ref.order_by("timestamp", direction=firestore.Query.DESCENDING)
         docs = list(all_messages_query.stream()) # Get all docs
 
-        # If we have more than 40 messages, delete the oldest ones
-        if len(docs) > 40:
-            messages_to_delete = docs[40:] # Get all messages after the 40th
+        # If we have more than 25 messages, delete the oldest ones
+        if len(docs) > 25:
+            messages_to_delete = docs[25:] # Get all messages after the 25th
             for doc in messages_to_delete:
                 doc.reference.delete()
             logger.info(f"Pruned {len(messages_to_delete)} old messages from history for {user_id}")
@@ -129,7 +129,7 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
     # --- Part 2: Save the Simple Summary (like before) ---
     try:
         summary_prompt = (
-            f"Please summarize this short conversation into 1-2 simple sentences "
+            f"Please summarize this short conversation into 5-6 simple sentences "
             f"for a long-term memory. USER said: '{user_text}'. YOU replied: '{bot_text}'"
         )
         summary_response = await gemini_model.generate_content_async(summary_prompt)
@@ -145,8 +145,8 @@ async def save_memory(user_id: str, user_text: str, bot_text: str):
     try:
 
         learning_prompt = (
-        "Analyze this conversation. Extract *only* dynamic, personal user information. "
-        "Look for: new 'interests' (hobbies, likes, leisure activities) or new 'about' facts (personal info, memories, relationships, dislikes) except for name. "
+        "Analyze this conversation. Extract *only* dynamic, personal user information. If there is none, return nothing. "
+        "Strictly look for new 'interests', explicitly if the user says they like something eg (likes, leisure activities) or new 'about' facts (personal info, memories, hobbies, relationships, dislikes) except for name. "
         "Return *only* JSON in this format, or an empty object: "
         "{'interests': ['new_interest_1'], 'about': 'new fact about the user'}\n\n"
         f"USER: \"{user_text}\"\nAI: \"{bot_text}\""
@@ -680,7 +680,7 @@ async def telegram_webhook(request: Request):
             # --- STEP 1: FETCH HISTORY (Moved... up... so... *both*... paths... can... use... it!) ---
             history_list = []
             try:
-                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(40)
+                history_query = user_ref.collection("recent_chat_history").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(25)
                 docs = history_query.stream()
                 temp_history = []
                 for doc in docs:
